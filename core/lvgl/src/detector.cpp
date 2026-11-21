@@ -21,7 +21,9 @@
 #include "detector.h"
 #include "cam_feed.h"
 #include "cloud_detect.h"        /* 云端复核客户端（段2 帧上传） */
-#include "ui/ui_events.h"        /* ui_events_cloud_review_on()（云端复核开关） */
+#include "log_svc.h"             /* 分级异步日志 */
+#include "config_mgr.h"
+#include "thread_util.h"
 #include <ncnn/net.h>            /* ncnn（-I third_party/ncnn-armhf/include） */
 #include <stdio.h>
 #include <string.h>
@@ -36,20 +38,35 @@
 #define DET_H 340
 
 static detector_verifier_fn s_verifier = NULL;  /* P3 人脸识别引擎接入点（预留） */
-static uint8_t s_frame[DET_W * DET_H * 2];      /* 待精判帧（RGB565，最近一帧） */
-static volatile int s_frame_zone = -1;
 
-/* 待消费结论（worker 写，dev_bridge 200ms 周期轮询读；int 原子性交接） */
-static volatile int s_result_pending = 0;
-static volatile int s_result_zone = -1;
-static volatile int s_result = DET_RESULT_NONE;
-static volatile int s_result_stage = DET_STAGE_INITIAL;
-static char s_result_name[32];
+/* ---- T5-B：精判任务有界队列 ----
+ * 每个任务自带一份帧快照（628KB），避免"后一次提交覆盖前一任务帧"的错配。
+ * 深度 2：告警冷却已做节流，再多只会加剧单核排队；满时丢弃新任务并计数。 */
+#define DET_QUEUE_DEPTH 2
+static uint8_t s_job_frames[DET_QUEUE_DEPTH][DET_W * DET_H * 2];
+static int s_job_zone[DET_QUEUE_DEPTH];
 
+static int s_free_slots[DET_QUEUE_DEPTH];   /* 空闲槽位栈 */
+static int s_free_top = 0;
+static int s_job_ids[DET_QUEUE_DEPTH];      /* 待处理槽位环形队列 */
+static int s_job_head = 0;
+static int s_job_count = 0;
+static pthread_mutex_t s_job_lock = PTHREAD_MUTEX_INITIALIZER;
 static sem_t s_job_sem;
+
 static volatile int s_quit = 0;
-static volatile int s_job_zone = -1;
-static volatile int s_hits = 0;
+static pthread_t s_worker;
+static int s_worker_started = 0;
+static int s_drop_count = 0;                /* 队列满丢弃次数（诊断） */
+static int s_hits = 0;                      /* 命中计数（__atomic 访问） */
+
+/* ---- 待消费结论（worker 写，dev_bridge 轮询读；多字段用锁交接） ---- */
+static pthread_mutex_t s_result_lock = PTHREAD_MUTEX_INITIALIZER;
+static int s_result_pending = 0;
+static int s_result_zone = -1;
+static int s_result = DET_RESULT_NONE;
+static int s_result_stage = DET_STAGE_INITIAL;
+static char s_result_name[32];
 
 /* SCRFD 检测输入/结果（BGR 三通道，行宽 640=32 对齐） */
 #define DET_BGR_W 640
@@ -81,17 +98,17 @@ static int ncnn_load_once(void)
     s_scrfd->opt.use_vulkan_compute = false;
     s_scrfd->opt.num_threads = 1;   /* 单核 SoC：ncnn 内部不再开线程（与渲染/采集调度） */
     if (s_scrfd->load_param("/root/face.param") != 0) {
-        printf("[DET] load /root/face.param failed → 回退移动告警语义\n");
+        LOGW("DET", "load /root/face.param failed -> 回退移动告警语义");
         delete s_scrfd; s_scrfd = NULL;
         return -1;
     }
     if (s_scrfd->load_model("/root/face.bin") != 0) {
-        printf("[DET] load /root/face.bin failed → 回退移动告警语义\n");
+        LOGW("DET", "load /root/face.bin failed -> 回退移动告警语义");
         delete s_scrfd; s_scrfd = NULL;
         return -1;
     }
     s_ncnn_ok = 1;
-    printf("[DET] ncnn SCRFD ready\n");
+    LOGI("DET", "ncnn SCRFD ready");
     return 0;
 }
 
@@ -353,7 +370,7 @@ static int run_local_detect(const uint8_t *rgb565, int w, int h)
     clock_gettime(CLOCK_MONOTONIC, &b1);
     long ms = (b1.tv_sec - b0.tv_sec) * 1000 + (b1.tv_nsec - b0.tv_nsec) / 1000000;
 
-    printf("[DET] faces=%d (%ld ms)\n", (int)faces.size(), ms);
+    LOGD("DET", "faces=%d (%ld ms)", (int)faces.size(), ms);
 
     if (!faces.empty())
         return DET_RESULT_FACE_UNKNOWN;   /* 本地不做白名单比对：检出人脸=陌生人 */
@@ -369,18 +386,18 @@ static int run_cloud_review(const uint8_t *rgb565, int w, int h,
     if (type && type_n > 0) type[0] = 0;
     int r = cloud_detect_query((const uint16_t *)rgb565, w, h, type, type_n);
     if (r < 0) {
-        printf("[DET] cloud=unreachable\n");
+        LOGW("DET", "cloud=unreachable");
         return DET_RESULT_NONE;          /* 无云端结论：dev_bridge 按"维持/升级本地"定案 */
     }
     if (r == 2) {
-        printf("[DET] cloud=known (%s)\n", type && type[0] ? type : "-");
+        LOGI("DET", "cloud=known (%s)", type && type[0] ? type : "-");
         return DET_RESULT_FACE_KNOWN;    /* 白名单命中 → 在告警则自动消警 */
     }
     if (r == 1) {
-        printf("[DET] cloud=stranger (%s)\n", type && type[0] ? type : "-");
+        LOGW("DET", "cloud=stranger (%s)", type && type[0] ? type : "-");
         return DET_RESULT_FACE_UNKNOWN;  /* 陌生人 → 不在告警则升级告警 */
     }
-    printf("[DET] cloud=none\n");
+    LOGI("DET", "cloud=none");
     return DET_RESULT_OTHER;             /* 无人 → 在告警则自动消警（本地误报） */
 }
 
@@ -389,7 +406,12 @@ static void detector_report(int zone, int result, int stage, const char *name); 
 /* 等初步结论被 dev_bridge 消费（防最终结论覆盖初步结论；最多 ~1s） */
 static void wait_result_consumed(void)
 {
-    for (int i = 0; i < 20 && s_result_pending; i++) {
+    for (int i = 0; i < 20; i++) {
+        pthread_mutex_lock(&s_result_lock);
+        int pending = s_result_pending;
+        pthread_mutex_unlock(&s_result_lock);
+        if (!pending)
+            break;
         struct timespec ts = { 0, 50 * 1000 * 1000 };   /* 50ms */
         nanosleep(&ts, NULL);
     }
@@ -406,29 +428,73 @@ static void *worker_main(void *arg)
         sem_wait(&s_job_sem);
         if (s_quit) break;
 
+        pthread_mutex_lock(&s_job_lock);
+        int slot = s_job_ids[s_job_head];
+        s_job_head = (s_job_head + 1) % DET_QUEUE_DEPTH;
+        s_job_count--;
+        pthread_mutex_unlock(&s_job_lock);
+
+        const uint8_t *frame = s_job_frames[slot];
+        int zone = s_job_zone[slot];
+
         /* 段1：本地人脸检测 → 初步结论（dev_bridge：检出=立即 STRANGER 告警；
          * 未检出=画面变动轻提醒，等云端定论） */
-        int pre = run_local_detect(s_frame, DET_W, DET_H);
-        detector_report(s_job_zone, pre, DET_STAGE_INITIAL, NULL);
+        int pre = run_local_detect(frame, DET_W, DET_H);
+        detector_report(zone, pre, DET_STAGE_INITIAL, NULL);
         wait_result_consumed();
 
         /* 段2：云端复核（设置→云端复核 开；开关关时初步结论即最终，由 dev_bridge
          * 按"纯本地"语义处置）。不可达也发 FINAL 定案（dev_bridge 决定维持/升级） */
-        if (ui_events_cloud_review_on()) {
+        if (config_get()->cloud_review) {
             char type[16];
-            int fin = run_cloud_review(s_frame, DET_W, DET_H, type, sizeof(type));
-            detector_report(s_job_zone, fin, DET_STAGE_FINAL, type);
+            int fin = run_cloud_review(frame, DET_W, DET_H, type, sizeof(type));
+            detector_report(zone, fin, DET_STAGE_FINAL, type);
         }
+
+        pthread_mutex_lock(&s_job_lock);
+        s_free_slots[s_free_top++] = slot;   /* 归还槽位 */
+        pthread_mutex_unlock(&s_job_lock);
     }
     return NULL;
 }
 
 void detector_init(void)
 {
+    if (s_worker_started)
+        return;
+
     sem_init(&s_job_sem, 0, 0);
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, worker_main, NULL) == 0)
-        pthread_detach(tid);
+
+    pthread_mutex_lock(&s_job_lock);
+    s_free_top = 0;
+    for (int i = 0; i < DET_QUEUE_DEPTH; i++)
+        s_free_slots[s_free_top++] = i;
+    s_job_head = 0;
+    s_job_count = 0;
+    s_drop_count = 0;
+    pthread_mutex_unlock(&s_job_lock);
+
+    if (thread_start(&s_worker, 2048 * 1024, worker_main, NULL) == 0)
+        s_worker_started = 1;
+    else
+        LOGE("DET", "worker thread create failed");
+
+    LOGI("DET", "worker started, queue depth=%d", DET_QUEUE_DEPTH);
+}
+
+/* T5-B：停止工作线程并 join（云端复核最长 2.5s，join 可能等这么久） */
+void detector_stop(void)
+{
+    if (!s_worker_started)
+        return;
+
+    s_quit = 1;
+    sem_post(&s_job_sem);
+    pthread_join(s_worker, NULL);
+    s_worker_started = 0;
+    sem_destroy(&s_job_sem);
+    LOGI("DET", "worker stopped (hits=%d dropped=%d)",
+         __atomic_load_n(&s_hits, __ATOMIC_RELAXED), s_drop_count);
 }
 
 int detector_model_ready(void)
@@ -446,18 +512,42 @@ void detector_set_verifier(detector_verifier_fn fn)
 
 int detector_submit(int zone)
 {
-    s_hits++;
-    /* 抓取最近一帧（对比帧中最新者）作为精判数据图 */
-    if (cam_feed_copy_frame(s_frame) != 0)
+    __atomic_fetch_add(&s_hits, 1, __ATOMIC_RELAXED);
+
+    /* 1. 取一个空闲槽位；队列满则丢弃本次（不阻塞 UI 线程） */
+    pthread_mutex_lock(&s_job_lock);
+    if (s_free_top == 0) {
+        s_drop_count++;
+        int drops = s_drop_count;
+        pthread_mutex_unlock(&s_job_lock);
+        LOGW("DET", "job queue full, drop (total=%d)", drops);
+        return 0;
+    }
+    int slot = s_free_slots[--s_free_top];
+    pthread_mutex_unlock(&s_job_lock);
+
+    /* 2. 帧快照（此时槽位独占，不会被其他提交改写） */
+    if (cam_feed_copy_frame(s_job_frames[slot]) != 0) {
+        pthread_mutex_lock(&s_job_lock);
+        s_free_slots[s_free_top++] = slot;
+        pthread_mutex_unlock(&s_job_lock);
         return 0;                     /* 无帧可抓（采集未就绪） */
-    s_frame_zone = zone;
-    s_job_zone = zone;
-    sem_post(&s_job_sem);             /* 唤醒工作线程（忙时排队，冷却节流防积压） */
+    }
+    s_job_zone[slot] = zone;
+
+    /* 3. 入队并唤醒工作线程 */
+    pthread_mutex_lock(&s_job_lock);
+    s_job_ids[(s_job_head + s_job_count) % DET_QUEUE_DEPTH] = slot;
+    s_job_count++;
+    pthread_mutex_unlock(&s_job_lock);
+
+    sem_post(&s_job_sem);
     return 1;                         /* 已入队精判（结论异步经轮询分发） */
 }
 
 static void detector_report(int zone, int result, int stage, const char *name)
 {
+    pthread_mutex_lock(&s_result_lock);
     s_result_zone = zone;
     s_result = result;
     s_result_stage = stage;
@@ -468,19 +558,25 @@ static void detector_report(int zone, int result, int stage, const char *name)
         s_result_name[0] = 0;
     }
     s_result_pending = 1;             /* 发布（dev_bridge 轮询消费后清零） */
+    pthread_mutex_unlock(&s_result_lock);
 }
 
 int detector_poll_result(int *zone, int *result, int *stage, char *name, int name_n)
 {
-    if (!s_result_pending) return 0;
-    *zone = s_result_zone;
-    *result = s_result;
-    if (stage) *stage = s_result_stage;
+    pthread_mutex_lock(&s_result_lock);
+    if (!s_result_pending) {
+        pthread_mutex_unlock(&s_result_lock);
+        return 0;
+    }
+    if (zone)   *zone = s_result_zone;
+    if (result) *result = s_result;
+    if (stage)  *stage = s_result_stage;
     if (name && name_n > 0) {
         strncpy(name, s_result_name, name_n - 1);
         name[name_n - 1] = 0;
     }
     s_result_pending = 0;
+    pthread_mutex_unlock(&s_result_lock);
     return 1;
 }
 
@@ -488,7 +584,8 @@ int detector_get_info(char *buf, int n)
 {
     if (!buf || n <= 0) return -1;
     return snprintf(buf, n, "精判:%s 命中:%d",
-                    s_verifier ? "引擎" : "桩", (int)s_hits);
+                    s_verifier ? "引擎" : "桩",
+                    __atomic_load_n(&s_hits, __ATOMIC_RELAXED));
 }
 
 int detector_get_boxes(detector_box_t *out, int max)

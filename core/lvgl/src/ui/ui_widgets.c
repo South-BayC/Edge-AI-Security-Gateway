@@ -2,6 +2,7 @@
  * ui_widgets.c — 可复用 LVGL 小部件辅助函数
  */
 #include "ui_widgets.h"
+#include "ui_theme.h"
 #include <string.h>
 
 /* 声明中文字库 */
@@ -196,4 +197,27 @@ lv_obj_t *uiw_modal_create(lv_obj_t *parent, const char *title, int w)
     }
 
     return overlay;
+}
+
+lv_obj_t *uiw_label_cn(lv_obj_t *par, const char *txt, uint32_t hex)
+{
+    return uiw_label_font(par, txt, hex, FONT_UI);
+}
+
+lv_obj_t *uiw_mini_btn(lv_obj_t *par, const char *txt, uint32_t clr, lv_event_cb_t cb)
+{
+    lv_obj_t *b = lv_button_create(par);
+    if (!b) return NULL;
+    lv_obj_set_size(b, LV_SIZE_CONTENT, 30);
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(clr), 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_radius(b, 0, 0);
+    lv_obj_set_style_pad_left(b, 10, 0);
+    lv_obj_set_style_pad_right(b, 10, 0);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *l = uiw_label_font(b, txt, clr, FONT_UI);
+    if (l) lv_obj_center(l);
+    if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    return b;
 }

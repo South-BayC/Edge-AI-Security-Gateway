@@ -29,7 +29,9 @@
 """
 import os
 import numpy as np
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 app = FastAPI(title="imx6ull-gateway 云端精判", version="1.1")
 
@@ -53,6 +55,36 @@ PERSON_CLS = 0                         # COCO 类别 0 = person
 ANIMAL_CLS = {14, 15, 16, 17, 18, 19, 20, 21, 22, 23}   # 鸟猫狗马羊牛象熊斑马长颈鹿
 FACE_TOLERANCE = 0.6                   # 白名单比对容差（欧氏距离，越小越严；官方默认 0.6）
 WHITELIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whitelist")
+OTA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ota")
+
+# T11：HTTP 接口鉴权（X-API-Key）。优先环境变量 CLOUD_API_KEY，其次 cloud/secrets/api.key。
+# 未配置时保持开发模式（不校验），启动时打印警告。
+API_KEY = os.environ.get("CLOUD_API_KEY", "").strip()
+_API_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secrets", "api.key")
+if not os.path.isfile(_API_KEY_FILE):
+    # 兼容旧目录（迁移前生成的文件）
+    _API_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api.key")
+if not API_KEY and os.path.isfile(_API_KEY_FILE):
+    try:
+        with open(_API_KEY_FILE, "r", encoding="utf-8") as _f:
+            API_KEY = _f.read().strip()
+    except Exception:
+        API_KEY = ""
+
+if not API_KEY:
+    print("[cloud] 警告: 未配置 CLOUD_API_KEY / api.key，HTTP 接口不鉴权（仅限内网开发）")
+else:
+    print("[cloud] HTTP API Key 已启用（X-API-Key）")
+
+
+@app.middleware("http")
+async def api_key_mw(request: Request, call_next):
+    p = request.url.path
+    # /health 与文档接口保持开放，便于巡检
+    if API_KEY and p != "/health" and not p.startswith("/docs") and not p.startswith("/openapi"):
+        if request.headers.get("x-api-key") != API_KEY:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 def _norm_type(cls_id: int) -> str:
@@ -189,3 +221,84 @@ async def whitelist_add(request: Request, name: str = ""):
     with open(os.path.join(WHITELIST_DIR, name + ".jpg"), "wb") as f:
         f.write(await request.body())
     return {"ok": True, "name": name}
+
+
+# ================================================================
+# OTA 静态文件（与精判共用 8000 端口，避免再起一个 http.server）
+#   包由 cloud/make_ota_pkg.sh 生成到 cloud/ota/
+#   板端: GATEWAY_OTA_URL=http://192.168.3.26:8000/ota/manifest.json
+# ================================================================
+@app.get("/ota/{name}")
+async def ota_download(name: str):
+    safe = os.path.basename(name)
+    if not safe or safe != name:          # 禁止目录穿越
+        raise HTTPException(status_code=404)
+    path = os.path.join(OTA_DIR, safe)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404)
+    return FileResponse(path, media_type="application/octet-stream")
+
+
+@app.post("/cmd")
+async def cmd_dispatch(request: Request):
+    """
+    T12 精简版：命令下发 + ACK 等待 + 超时重试。
+
+    请求体：
+      {"device":"gw-b8ae1d010000","cmd":"set_config","params":{...},
+       "timeout":2.0,"retries":3,"id":可选}
+    返回：
+      {"ok":true,"attempts":1,"ack":{...},"id":123}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json")
+
+    device = str(body.get("device") or body.get("device_id") or "").strip()
+    cmd = str(body.get("cmd") or "").strip()
+    if not device or not cmd:
+        raise HTTPException(status_code=400, detail="device and cmd required")
+
+    params = body.get("params") or {}
+    if not isinstance(params, dict):
+        raise HTTPException(status_code=400, detail="params must be an object")
+
+    try:
+        timeout = float(body.get("timeout", 2.0))
+        retries = int(body.get("retries", 3))
+        cmd_id = body.get("id")
+        cmd_id = int(cmd_id) if cmd_id is not None else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="bad timeout/retries/id")
+
+    try:
+        from cmd_send import send_command
+    except Exception as e:
+        raise HTTPException(status_code=503,
+                            detail="paho-mqtt unavailable: %s" % e)
+
+    res = await run_in_threadpool(send_command, device, cmd, params,
+                                  timeout, retries, cmd_id)
+    return JSONResponse(res)
+
+
+@app.get("/health")
+async def health():
+    """统一状态：精判模型/人脸库/OTA 包，供 cloudctl.sh status 与巡检使用"""
+    if _FR_OK:
+        try:
+            _load_whitelist()
+        except Exception:
+            pass
+    pkgs = []
+    if os.path.isdir(OTA_DIR):
+        pkgs = sorted(f for f in os.listdir(OTA_DIR) if f.endswith(".tar.gz"))
+    return {
+        "service": "edge-ai-gateway-cloud",
+        "version": "1.2",
+        "detect_model": _MODEL_OK,
+        "face_recognition": _FR_OK,
+        "whitelist": _wl_names,
+        "ota_packages": pkgs,
+    }

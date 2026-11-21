@@ -996,10 +996,11 @@
 #define LV_LINUX_FBDEV_BSD           0
 #define LV_LINUX_FBDEV_RENDER_MODE   LV_DISPLAY_RENDER_MODE_PARTIAL
 #define LV_LINUX_FBDEV_BUFFER_COUNT  2
-#define LV_LINUX_FBDEV_BUFFER_SIZE   400  /* 08-29 定案：60→400 行（画布 340 行单块刷完），
-                                           配合 flush_cb 的 vsync 锁相 → 无撕裂。
-                                           （单独上 400 行会整幅位移，必须配 vsync）；
-                                           缓冲 1024×400×2×2 ≈ 1.6MB */
+#define LV_LINUX_FBDEV_BUFFER_SIZE   600  /* 11-11 定案：400→600 行。
+                                          屏幕 600 行，摄像头区（y≈92..432）跨 400 行分界，
+                                          会被拆成两块、VSYNC 只等第一块 → 上下/四分错位。
+                                          整屏缓冲后每次刷新单块拷贝，彻底消除跨块撕裂。
+                                          内存 1024×600×2×2 ≈ 2.4MB */
 #endif
 
 /*Use Nuttx to open window and handle touchscreen*/

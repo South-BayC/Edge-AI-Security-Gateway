@@ -256,11 +256,13 @@ void lv_linux_fbdev_set_force_refresh(lv_display_t * disp, bool enabled)
  *   STATIC FUNCTIONS
  **********************/
 
+/* VSYNC 锁相状态（供 UI 判断是否丢弃摄像头帧） */
+static int s_wait_vsync = 1;
+static int s_vsync_fail = 0;
+
 static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * color_p)
 {
     lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
-    static int wait_vsync = 1;   /* 每刷新周期仅首个分块前等一次 vsync */
-    static int vsync_fail = 0;   /* 连续失败计数（fb blank/息屏态自动退避） */
 
     if(dsc->fbp == NULL) {
         lv_display_flush_ready(disp);
@@ -326,14 +328,14 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
      * 状态自适应：fb blank（息屏 60s 无触摸自动触发）时驱动拒绝等待，
      * 本周期跳过且按 1/300 稀疏重探（≈10s 一次），唤醒后自动恢复锁相；
      * 息屏期间屏幕无显示，无撕裂顾虑。[此修复替换早前的无条件等待版] */
-    if(wait_vsync && dsc->fbfd >= 0) {
+    if(s_wait_vsync && dsc->fbfd >= 0) {
         int dummy = 0;
         if(ioctl(dsc->fbfd, FBIO_WAITFORVSYNC, &dummy) == 0) {
-            vsync_fail = 0;
-            wait_vsync = 0;                 /* 本周期已锁相 */
+            s_vsync_fail = 0;
+            s_wait_vsync = 0;               /* 本周期已锁相 */
         } else {
-            vsync_fail++;
-            wait_vsync = 0;                 /* 本周期放弃等待（blank 态） */
+            s_vsync_fail++;
+            s_wait_vsync = 0;               /* 本周期放弃等待（blank 态） */
         }
     }
 
@@ -370,8 +372,12 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
         }
     }
 
-    if(lv_display_flush_is_last(disp))
-        wait_vsync = (vsync_fail == 0) || (vsync_fail % 300 == 0);
+    if(lv_display_flush_is_last(disp)) {
+        /* VSYNC 失败（息屏/唤醒瞬间）后快速重试：
+         * 原逻辑要等 300 帧（≈10s@30fps）才重试，期间持续撕裂；
+         * 改为 3 帧内恢复，失败期间每 10 帧探测一次。 */
+        s_wait_vsync = (s_vsync_fail < 3) || (s_vsync_fail % 10 == 0);
+    }
 
     lv_display_flush_ready(disp);
 }
@@ -382,6 +388,12 @@ static uint32_t tick_get_cb(void)
     clock_gettime(CLOCK_MONOTONIC, &t);
     uint64_t time_ms = t.tv_sec * 1000 + (t.tv_nsec / 1000000);
     return time_ms;
+}
+
+/* 供应用层做“撕裂保护丢帧”：VSYNC 未锁定时返回 0 */
+int lv_linux_fbdev_vsync_ok(void)
+{
+    return s_vsync_fail == 0;
 }
 
 #endif /*LV_USE_LINUX_FBDEV*/

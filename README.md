@@ -1,4 +1,4 @@
-# imx6ull-drivers — 边缘智能安防网关 + 全外设驱动工程
+# Edge AI Security Gateway — 边缘智能安防网关 + 全外设驱动工程
 
 > **阅读导航**：本 README 是快速总览（架构概览 + 命令速查）。
 > **完整项目文档**（架构设计 / 各功能模块学习 / 现有功能使用介绍与命令）见
@@ -22,7 +22,7 @@
 ## 一、项目结构
 
 ```
-imx6ull-drivers/
+Edge-AI-Gateway/
 ├── Makefile                     # 顶层编译调度（all/core/dts/lvgl/send/clean）
 ├── README.md                    # 本文件（总说明 + 使用文档）
 │
@@ -43,10 +43,26 @@ imx6ull-drivers/
 │       └── src/
 │           ├── main.c           #   入口：port 初始化 → UI → 桥接 → 主循环
 │           ├── lvgl_port.c/h    #   LVGL 适配：fbdev + 触摸自动探测（按驱动名过滤 eventX）
+│           ├── domain/          #   领域层：zone_state、imu_math、warn_policy/warn_rule、json_util
+│           ├── infra/hal_io.c/h #   基础设施层：LED/蜂鸣器/PWM 设备访问
+│           ├── infra/mqtt_client.c/h #  基础设施层：MQTT 报文与连接（传输走 mqtt_transport）
+│           ├── app/mqtt_commands.c/h #  应用层：云端命令分发（配置/OTA/回读 + ACK + 去重）
 │           ├── ui/              #   UI 层
-│           │   ├── ui_home.c    #     主界面/弹窗/设置/相册/告警面板 + ui_events 实现
+│           │   ├── ui_home.c    #     主界面/弹窗/设置/相册/告警面板
+│           │   ├── ui_events.c/h #    真实信号接入实现（状态/告警/日志/网络/配置刷新）
+│           │   ├── ui_internal.h #    ui 层内部共享对象与刷新能力（仅 ui/ 可包含）
 │           │   ├── ui_events.h  #     事件接口（状态机↔桥接↔UI 的唯一 API 面）
-│           │   └── ui_widgets.c/h #   通用控件（卡片/按钮/模态/toast）
+│           │   ├── ui_theme.h   #     色板 + 字体（ui 层共用）
+│           │   ├── ui_terminal.c/h #   本地调试终端（fork/pipe + 软键盘）
+│           │   ├── ui_widgets.c/h #   通用控件（卡片/按钮/模态/toast）
+│           │   ├── panels/ui_status_bar.c/h # 顶部状态栏（标题/时钟/联网/布防）
+│           │   ├── panels/ui_timeline.c/h # 事件时间轴（计数/清空/条目/查看回调）
+│           │   ├── panels/ui_sensor.c/h # 检测页（卡片/校准/曲线/系统信息）
+│           │   ├── modals/ui_alarm.c/h # 告警确认弹窗（长按 1s 消警 + 静音）
+│           │   ├── modals/ui_settings.c/h # 设置弹窗（亮度/复核/阈值/定时）
+│           │   ├── modals/ui_album.c/h # 抓拍相册 + 查看器
+│           │   ├── ui_canvas.c/h # canvas 像素绘制（入侵框）
+│           │   ├── ui_time.c/h  # 事件时间字符串（HH:MM）
 │           ├── dev_bridge.c/h   #   外设桥接线程+200ms 定时器：KEY0/传感器 IIO 采集 → UI；
 │           │                    #     预警阈值配置；粗判命中节流提交；精判结论两级分发；
 │           │                    #     告警分级声光（LED/蜂鸣）联动
@@ -57,25 +73,27 @@ imx6ull-drivers/
 │           ├── cloud_detect.c/h #   云端复核客户端（原 TCP+HTTP POST，428KB 帧上传，2.5s 超时）
 │           ├── mqtt_hub.c/h     #   MQTT 3.1.1 QoS0 零依赖客户端（事件上报，fire-and-forget）
 │           ├── storage_mgr.c/h  #   抓拍持久化（TF 卡 BMP，满卡清理，重启相册回填）
-│           ├── state_machine.c/h#   分区状态机（ONLINE/ARMED/ALARM/OFFLINE）
-│           ├── font/            #   中文字库 SHSC 16/20px（3500 常用字大子集）
+│           ├── zone_types.h     #   分区状态枚举（ONLINE/ARMED/ALARM/OFFLINE，中立类型）
+│           ├── domain/zone_state.c/h # 分区状态（ONLINE/ARMED/ALARM/OFFLINE，领域层）
+│           ├── config_types.h   #   中立配置类型（zone_warn_cfg/dev_config）
+│           ├── font/            #   中文字库：SHSC 16/20px + Noto 补充字库（16px）
 │           └── sim_main.c       #   PC 模拟器入口（SDL，开发调试用，板端不编译）
 │
 ├── cloud/                       # ── 项目 A：云端精判服务（Python，运行于 VM/主机）──
 │   ├── server.py                #   FastAPI + YOLOv8n（人员/类型检测）+ face_recognition（白名单比对）
-│   ├── requirements.txt         #   依赖清单（fastapi/uvicorn/ultralytics/numpy/face_recognition）
+│   ├── requirements.txt         #   依赖清单（fastapi/uvicorn/ultralytics/numpy/face_recognition/paho-mqtt）
 │   ├── whitelist/               #   白名单照片目录（<姓名>.jpg，自动加载/变化自动重载）
 │   ├── yolov8n.pt               #   YOLO 权重（国内镜像预下载，服务启动免外网）
 │   └── README.md                #   服务部署/协议/白名单管理文档
 │
-├── models/                      # 板端推理模型（make send 部署到板 /root/）
+├── models/                      # 板端推理模型（make deploy 部署到板 /root/）
 │   ├── face.param               #   SCRFD-500M-opt2 ncnn 模型（ncnn-assets 官方转换）
 │   └── face.bin
 │
 ├── dts/                         # 设备树（imx6ull-southbay-emmc.dts：CSI/74HC595/触摸/网口拓扑）
 ├── benchmark/                   # 基准方法学（结果表待实测回填）
 ├── docs/                        # 设计文档（驱动架构决策/内核补丁档案/LVGL 网关设计书）
-├── third_party/                 # ncnn 源码 + ncnn-armhf 交叉编译产物 + ncnn-assets 模型等
+├── third_party/                 # ncnn/mbedTLS 源码+armhf 产物、字体（清单见 docs/dependencies.md）
 └── build/                       # 编译输出（git 忽略）：结果与过程文件分开
     ├── module/                  #   结果：8 个驱动 .ko
     ├── dts/                     #   结果：设备树 .dtb
@@ -148,11 +166,12 @@ make dts          # 只编译设备树
 make lvgl         # 只编译 lvgl 网关应用
 make clean        # 清理 build/
 
-make send         # 部署到开发板（需 sudo 密码）：
+make deploy       # 构建并部署到开发板（需 sudo 密码）：
+                  #   core/dts/lvgl 全量构建
                   #   驱动 .ko → NFS /lib/modules/4.1.15/
                   #   dtb → TFTP 目录
-                  #   lvgl_gateway → NFS /usr/bin/（板端 rcS 自启）
-                  #   models/face.param|bin → NFS /root/（SCRFD 精判模型）
+                  #   lvgl_gateway → NFS /usr/bin/ 与 current 指向的 release
+                  #   models/face.param|bin → NFS /root/
 ```
 
 > 注意：Makefile 的 .o 规则只跟踪 lv_conf.h，**修改 .h 头文件后需 `rm build/lvgl/src/<模块>.o` 或 touch 对应 .c 再 make**。
@@ -205,7 +224,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 - **识别设置**：`云端复核` 开关（开=两级管线，默认；关=纯本地：未检出人脸即 INTRUDER）
 - **检测设置**：帧差间隔（1~30 帧）/ 灰度差阈值（5~100）——粗判灵敏度
 - **预警设置**：四位置 × 触发源 × 数据通道 × 阈值 × 比较方式 × 冷却时间（传感器预警）
-- **定时布防**：时间段自动布防；**音量/网络状态/关于** 等
+- **定时布防**：时间段自动布防；**网络状态/关于** 等
 
 ### 4.3 告警分级（设计 2.2）
 

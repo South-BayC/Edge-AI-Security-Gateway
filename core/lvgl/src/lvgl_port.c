@@ -1,4 +1,17 @@
+/**
+ * lvgl_port.c — LVGL 板级移植层（实现）
+ *
+ * 完成两件事：
+ *   1) 显示：lv_linux_fbdev_create() + lv_linux_fbdev_set_file("/dev/fb0")
+ *      把 LVGL 渲染输出到真实屏幕的 framebuffer；
+ *   2) 触摸：find_touch_dev() 在 /dev/input 下按"设备名字含 gt9147/goodix/gt9"
+ *      过滤，动态找到触摸屏对应的 eventX（不能写死 event0/1，因为 event 编号
+ *      随驱动加载顺序变化），再交给 lv_evdev_create() 处理触摸事件。
+ *
+ * 系统时钟：用 clock_gettime(CLOCK_MONOTONIC) 提供毫秒 tick，供 LVGL 定时器用。
+ */
 #include "lvgl_port.h"
+#include "log_svc.h"
 #include "lvgl/lvgl.h"
 #include "lvgl/src/drivers/display/fb/lv_linux_fbdev.h"
 #include "lvgl/src/drivers/evdev/lv_evdev.h"
@@ -66,29 +79,36 @@ int lvgl_port_init(void) {
 
     s_disp = lv_linux_fbdev_create();
     if (!s_disp) {
-        printf("[LVGL] fbdev create failed\n");
+        LOGE("LVGL", "fbdev create failed");
         return LVGL_PORT_ERR_FBDEV_OPEN;
     }
     lv_linux_fbdev_set_file(s_disp, "/dev/fb0");
-    printf("[LVGL] fbdev /dev/fb0 ready (1024x600)\n");
+    LOGI("LVGL", "fbdev /dev/fb0 ready (1024x600)");
 
     /* 触摸：自动探测（名字含 gt9147/goodix/gt9），不依赖固定 event 号 */
     char touch_path[64] = {0};
     if (find_touch_dev(touch_path, sizeof(touch_path)) != 0) {
-        printf("[LVGL] touch device not found (gt9147 loaded?), touch disabled\n");
+        LOGW("LVGL", "touch device not found (gt9147 loaded?), touch disabled");
         return LVGL_PORT_ERR_OK;
     }
 
     s_indev = lv_evdev_create(LV_INDEV_TYPE_POINTER, touch_path);
     if (!s_indev) {
-        printf("[LVGL] evdev create failed (%s)\n", touch_path);
+        LOGE("LVGL", "evdev create failed (%s)", touch_path);
         return LVGL_PORT_ERR_OK;
     }
     lv_indev_set_display(s_indev, s_disp);
-    printf("[LVGL] touch ready: %s\n", touch_path);
+    LOGI("LVGL", "touch ready: %s", touch_path);
     return LVGL_PORT_ERR_OK;
 }
 
 void lvgl_port_deinit(void) {
     // LVGL v9 由内部管理，暂无需显式释放
+}
+
+int lvgl_port_vsync_ok(void)
+{
+    if (!s_disp)
+        return 1;   /* 模拟器/未初始化：不做限制 */
+    return lv_linux_fbdev_vsync_ok();
 }

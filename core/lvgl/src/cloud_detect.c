@@ -28,6 +28,12 @@
 #define CLOUD_DETECT_RESP_MAX        4096
 
 static char s_server[64] = CLOUD_DETECT_SERVER;
+static char s_api_key[80];              /* T11：X-API-Key（空=不携带） */
+
+void cloud_detect_set_api_key(const char *key)
+{
+    snprintf(s_api_key, sizeof(s_api_key), "%s", (key && key[0]) ? key : "");
+}
 
 void cloud_detect_set_server(const char *ipport)
 {
@@ -103,14 +109,26 @@ int cloud_detect_query(const uint16_t *rgb565, int w, int h,
 
     /* HTTP 头 + RGB565 帧（428KB，百兆网 ~50ms） */
     size_t body_len = (size_t)w * h * 2;
-    char hdr[256];
-    int hn = snprintf(hdr, sizeof(hdr),
+    char hdr[384];
+    int hn;
+    if (s_api_key[0]) {
+        hn = snprintf(hdr, sizeof(hdr),
+                      "POST /detect?w=%d&h=%d HTTP/1.1\r\n"
+                      "Host: %s\r\n"
+                      "X-API-Key: %s\r\n"
+                      "Content-Type: application/octet-stream\r\n"
+                      "Content-Length: %zu\r\n"
+                      "Connection: close\r\n\r\n",
+                      w, h, s_server, s_api_key, body_len);
+    } else {
+        hn = snprintf(hdr, sizeof(hdr),
                       "POST /detect?w=%d&h=%d HTTP/1.1\r\n"
                       "Host: %s\r\n"
                       "Content-Type: application/octet-stream\r\n"
                       "Content-Length: %zu\r\n"
                       "Connection: close\r\n\r\n",
                       w, h, s_server, body_len);
+    }
 
     int fail = 0;
     if (send_all(fd, hdr, (size_t)hn) < 0 ||

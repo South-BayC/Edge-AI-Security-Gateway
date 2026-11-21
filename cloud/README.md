@@ -1,4 +1,4 @@
-# 云端精判服务（YOLOv8 人员检测 + 人脸白名单比对）
+# 云端精判服务（YOLOv8 人员检测 + 人脸白名单比对 + OTA 包分发）
 
 接收网关上传的 RGB565 帧，两级判定：
 1. **YOLOv8n** 判定画面中是否有**人员**；
@@ -6,6 +6,9 @@
 
 返回 JSON 结论，设备端按结论告警。
 对应设备端：`core/lvgl/src/cloud_detect.c`（识别模式=云端精判 时启用）。
+
+同一进程还提供 **OTA 包下载**（`/ota/`），与精判共用 8000 端口；
+MQTT broker 由 `cloudctl.sh` 一起拉起（1883）。
 
 ## 安装（VM/主机）
 
@@ -40,10 +43,120 @@ python -c "import face_recognition; print('FR OK')"
 
 ```bash
 cd cloud
+chmod +x cloudctl.sh make_ota_pkg.sh gen_ota_keys.sh gen_mqtt_passwd.sh   # 一次性
+./cloudctl.sh start      # 启动 精判+OTA(8000) 与 MQTT(1883)
+./cloudctl.sh status     # 进程/端口/health/chrony
+./cloudctl.sh logs       # tail -f 两个日志
+./cloudctl.sh restart    # 改配置/账号后重启
+./cloudctl.sh stop
+```
+
+> `start` 内部用 `nohup` 启动，**关闭终端不会退出**；只有手动 `stop` 或 VM 重启后才需要重新 `start`。
+> 确认仍在运行：`ss -tln | grep -E ':(8000|1883)'`。
+
+`cloudctl.sh` 会自动：
+
+- 优先使用 `~/cloud-venv/bin/python3`（若无则用系统 `python3`）；
+- 检查 8000/1883 端口占用、系统 `mosquitto` 服务冲突；
+- 日志写到 `cloud/logs/cloud.log`、`cloud/logs/mosquitto.log`；
+- 提示 chrony 是否在运行（NTP 授时，板端时间同步依赖它）。
+
+手动单独启动也可以用：
+
+```bash
+cd cloud
 uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-确认监听：`ss -tlnp | grep 8000`
+确认监听：`ss -tlnp | grep -E ':(8000|1883)'`
+
+## OTA 包（与精判同端口）
+
+```bash
+cd cloud
+./make_ota_pkg.sh 1.2.0                     # 默认取 ../build/lvgl/lvgl_gateway
+# 或指定二进制：./make_ota_pkg.sh 1.2.0 /path/to/lvgl_gateway
+```
+
+生成：
+
+```
+cloud/ota/pkg-1.2.0.tar.gz    # manifest.json + payload.tar.gz + checksums.sha256
+cloud/ota/manifest.json       # 版本 + 包名 + sha256
+```
+
+板端有两种触发方式（详见 `docs/verification-guide.md` 3.15）：
+
+```bash
+# ① 启动/定时拉取
+GATEWAY_OTA_URL=http://192.168.3.26:8000/ota/manifest.json \
+GATEWAY_OTA_INTERVAL_MIN=0 /opt/edge-gateway/current/lvgl_gateway &
+
+# ② 远程下发（推荐，只在需要时触发）
+mosquitto_pub -h 127.0.0.1 -t 'gateway/gw-<MAC>/cmd' \
+  -m '{"cmd":"ota","id":7,"url":"http://192.168.3.26:8000/ota/manifest.json"}'
+```
+
+> `GATEWAY_OTA_INTERVAL_MIN` 缺省为 0：不设置时**只有 MQTT 下发才会升级**。
+
+## HTTP 鉴权（T11-B2）
+
+```bash
+cd cloud
+./gen_api_key.sh              # 生成 secrets/api.key（600），打印 Key
+./cloudctl.sh restart         # server.py 启动时读取
+```
+
+- 除 `/health`（与 `/docs`）外，所有接口都要求请求头 `X-API-Key: <key>`；
+- 未配置 `secrets/api.key` / `CLOUD_API_KEY` 时不校验（启动时打印警告，仅限内网开发）；
+- 板端把 Key 写入 `gateway.json` 的 `cloud_api_key`（或 `set_config` 下发），
+  应用会自动带给 `/detect` 与 OTA 下载请求；
+- 命令行测试：
+
+```bash
+curl -H "X-API-Key: <key>" http://127.0.0.1:8000/whitelist
+```
+
+## MQTT TLS（T11-③，8883）
+
+```bash
+cd cloud
+./gen_tls_certs.sh            # 生成 certs/ca.crt + server.crt/key（SAN 默认 192.168.3.26）
+./cloudctl.sh restart         # 同时监听 1883（明文）与 8883（TLS 1.2）
+```
+
+- 单向认证：板端用 `ca.crt` 校验服务器证书，客户端仍用用户名/密码；
+- 板端配置（`gateway.json`）：
+  `"mqtt_port": 8883, "mqtt_tls": 1, "mqtt_ca_path": "/opt/edge-gateway/certs/ca.crt"`；
+- `make deploy` 会把 `certs/ca.crt` 复制到板端 `/opt/edge-gateway/certs/`；
+- 自检：
+
+```bash
+mosquitto_sub -h 127.0.0.1 -p 8883 --cafile certs/ca.crt \
+  -u gateway -P '<密码>' -t 'gateway/#' -v -C 1 -W 3
+```
+
+> 自签证书仅用于开发；生产应换成正式 CA 签发的证书（SAN 必须包含连接用的 IP/域名）。
+
+## 命令下发（ACK + 超时重试，T12 精简版）
+
+```bash
+pip install paho-mqtt          # 或 ~/cloud-venv/bin/pip install -r requirements.lock.txt
+echo 'Gw#2026pass' > secrets/mqtt.pass && chmod 600 secrets/mqtt.pass   # broker 密码（CLI 与 /cmd 共用）
+
+# CLI（paho 装在 cloud-venv）
+~/cloud-venv/bin/python3 ./cmd_send.py --device gw-b8ae1d010000 --cmd set_config \
+  --params '{"brightness":70}' --timeout 2 --retries 3
+
+# HTTP（走 X-API-Key）
+curl -s -X POST http://127.0.0.1:8000/cmd \
+  -H "X-API-Key: $(cat secrets/api.key)" -H 'Content-Type: application/json' \
+  -d '{"device":"gw-b8ae1d010000","cmd":"set_config","params":{"brightness":70}}'
+```
+
+- 设备端 ACK：`gateway/{id}/cmd/ack`，内容 `{"id":N,"cmd":"...","ok":true}`；
+- 超时未收到同 id ACK 会重发（默认 2s × 3 次）；
+- 设备端对最近 16 个命令 id 去重：重试只补 ACK，不会重复执行（OTA 不会被重复触发）。
 
 ## 白名单管理
 

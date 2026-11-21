@@ -39,6 +39,9 @@ void lv_linux_fbdev_set_file(lv_display_t * disp, const char * file);
  */
 void lv_linux_fbdev_set_force_refresh(lv_display_t * disp, bool enabled);
 
+/** 当前 VSYNC 是否锁定（应用层可据此丢弃摄像头帧，避免撕裂） */
+int lv_linux_fbdev_vsync_ok(void);
+
 /**********************
  *      MACROS
  **********************/

@@ -12,8 +12,21 @@
 #include "cam_feed.h"
 #include "detector.h"
 #include "cloud_detect.h"
-#include "ui/ui_events.h"
-#include "lvgl/lvgl.h"
+#include "config_mgr.h"
+#include "log_svc.h"
+#include "sensor_mgr.h"
+#include "sensor_calib.h"
+#include "health_mgr.h"
+#include "event_bus.h"
+#include "alarm_fsm.h"
+#include "domain/zone_state.h"
+#include "domain/sensors/imu_math.h"
+#include "domain/alarm/warn_policy.h"
+#include "domain/warn_rule.h"
+#include "infra/hal_io.h"
+#include "infra/sensor_pipeline.h"
+#include "thread_util.h"
+#include "fusion.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,25 +35,13 @@
 #include <unistd.h>
 #include <errno.h>
 #include <math.h>
+#include <stdint.h>
 #include <dirent.h>
 #include <time.h>
 #include <pthread.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <linux/input.h>
-
-/* ---- 驱动 UAPI（与 core/ 各驱动 uapi 保持一致，内联声明避免跨目录依赖） ---- */
-
-/* led_uapi.h */
-#define LED_IOC_MAGIC 'L'
-#define LED_IOC_ON    _IO(LED_IOC_MAGIC, 0x01)
-#define LED_IOC_OFF   _IO(LED_IOC_MAGIC, 0x02)
-
-/* beep_pwm.h（PWM 蜂鸣器手动控制） */
-#define BEEP_IOC_SET_FREQ _IOW('B', 1, int)
-#define BEEP_IOC_SET_DUTY _IOW('B', 2, int)
-#define BEEP_IOC_ON       _IO('B', 3)
-#define BEEP_IOC_OFF      _IO('B', 4)
 
 /* ---- KEY0：gpio-keys input 子系统（dts key-input 节点，code=227 KEY_ARMED）---- */
 #define KEY_DEV_NAME  "imx6ull-gpio-keys"
@@ -52,12 +53,6 @@
 /* AP3216C/ICM20608 已迁移 IIO 框架（P7-4）：用户态走
  * /sys/bus/iio/devices/iio:deviceX/ 下的通道属性文件（见 find_iio_path） */
 #define IIO_SYSFS   "/sys/bus/iio/devices"
-#define DEV_LED     "/dev/led"
-#define DEV_BEEP    "/sys/class/leds/beep/brightness"
-/*                     ↑ 出厂 dts gpio-leds 节点（label="beep", GPIO5_IO01 低有效）
- *                       内核已处理极性：写 '1' 响 / '0' 停 */
-#define DEV_PWM     "/dev/beep_pwm0"         /* 外接无源蜂鸣器（PWM3） */
-#define PWM_DEFAULT_FREQ 1000                /* beep_pwm 默认 period=1ms → 1kHz */
 
 /* 探测 IIO 设备：遍历 iio:device*，读 name 属性匹配（如 "ap3216c"）。
  * 找到则输出设备目录路径（如 /sys/bus/iio/devices/iio:device0） */
@@ -113,60 +108,42 @@ static int read_iio_int(int fd, int *val)
     return 0;
 }
 
-#define DEV_PWM     "/dev/beep_pwm0"   /* 外接无源蜂鸣器（PWM3，仅探测在位） */
-
 /* ---- 阈值/周期 ---- */
 #define POLL_MS          100     /* KEY0 poll 超时 = 采集循环节拍 */
-#define ALS_PERIOD       5       /* 每 N 个节拍读一次 ap3216c（500ms） */
-#define IMU_PERIOD       2       /* 每 N 个节拍读一次 icm20608（200ms） */
+#define ALS_PERIOD       1       /* 每 N 个节拍读一次 ap3216c（100ms，10Hz） */
+#define IMU_PERIOD       1       /* 每 N 个节拍读一次 icm20608（100ms，10Hz；T3-A） */
 
 /* ---- 预警阈值配置（设置弹窗可调，采集线程读取） ---- */
 static struct dev_config g_cfg = {
     .zones = {
-        /* 前门:   AP3216C 距离 > 30 触发 */
-        { .src = WARN_SRC_AP3216C, .channel = AP_DATA_PS, .threshold = 30, .cmp = WARN_CMP_GT, .enabled = 1 },
+        /* 前门:   AP3216C 距离 > 30 告警；> 20 只预警（双阈值） */
+        { .src = WARN_SRC_AP3216C, .channel = AP_DATA_PS, .threshold = 30,
+          .threshold_warn = 20, .cmp = WARN_CMP_GT, .enabled = 1 },
         /* 后门:   默认不触发 */
-        { .src = WARN_SRC_NONE, .channel = 0, .threshold = 0, .cmp = WARN_CMP_GT, .enabled = 0 },
+        { .src = WARN_SRC_NONE, .channel = 0, .threshold = 0,
+          .threshold_warn = 0, .cmp = WARN_CMP_GT, .enabled = 0 },
         /* 窗户:   默认不触发 */
-        { .src = WARN_SRC_NONE, .channel = 0, .threshold = 0, .cmp = WARN_CMP_GT, .enabled = 0 },
-        /* 仓库:   ICM 合加速度 > 150 触发 */
-        { .src = WARN_SRC_ICM, .channel = IMU_DATA_MAG, .threshold = 150, .cmp = WARN_CMP_GT, .enabled = 1 },
+        { .src = WARN_SRC_NONE, .channel = 0, .threshold = 0,
+          .threshold_warn = 0, .cmp = WARN_CMP_GT, .enabled = 0 },
+        /* 仓库:   ICM 去重力线性加速度 > 30 告警；> 15 只预警
+         * （旧版为合加速度 > 150，阈值语义已随 C3 切换） */
+        { .src = WARN_SRC_ICM, .channel = IMU_DATA_LIN, .threshold = 30,
+          .threshold_warn = 15, .cmp = WARN_CMP_GT, .enabled = 1 },
     },
     .debounce = 2,
     .cooldown_sec = 60,   /* 消警后 60s 冷却，期间不重复触发 */
 };
+static int g_cfg_loaded = 0;   /* 是否已从持久化配置恢复（UI 可能早于 dev_bridge_start 读取） */
+static int g_started = 0;      /* dev_bridge_start 幂等标志 */
 
-/* ---- 共享状态（采集线程写 / LVGL 定时器读） ---- */
-struct dev_shm {
-    pthread_mutex_t lock;
-    int key_toggle;        /* KEY0 按下事件计数（消费后清零） */
-    int warn_hit[4];       /* 各位置预警触发标志（消费后清零） */
-    /* ---- 诊断快照（采集线程持续刷新） ---- */
-    int key_ok, als_ok, imu_ok;   /* 设备在位 */
-    int key_level;                /* KEY0 当前电平 1=按下 */
-    int als_ir, als_als, als_ps;  /* AP3216C 最新原始值 */
-    int imu_ax, imu_ay, imu_az;   /* ICM20608 最新原始值 */
-    int imu_temp_x10;             /* 温度 ℃×10 */
-    /* ---- 测试面板使能（手动开关） ---- */
-    int als_en, imu_en;           /* 采集使能 1=开 */
-};
+/* 单调时钟（融合/轮询使用） */
+static uint32_t now_ms32(void);
 
-static struct dev_shm g_shm = {
-    .lock = PTHREAD_MUTEX_INITIALIZER,
-};
-static int g_started = 0;
-
-/* ---- 控制输出句柄（LVGL 定时器线程专用，无需加锁） ---- */
-static int g_led_fd  = -1;
-static int g_beep_fd = -1;
-static int g_pwm_fd  = -1;
-static int g_led_on  = -1;   /* 上次 LED 状态（-1=未知） */
-static int g_beep_on = -1;   /* 上次蜂鸣器状态（-1=未知） */
-static int g_pwm_on_cur = 0; /* 当前 PWM 开关状态（测试面板可调） */
-static int g_pwm_freq_cur = PWM_DEFAULT_FREQ;  /* 当前 PWM 频率（测试面板可调） */
+/* ---- 告警声光策略（分级节拍/手动锁定/静音，纯逻辑见 domain/alarm） ---- */
+static warn_policy_t g_warn;
 static time_t g_zone_last_trigger[4] = {0};    /* 各位置上次触发时间（冷却用） */
-static int g_beep_muted = 0;  /* 静音挂起（告警弹窗静音按钮；消警自动解除） */
-static int g_snd_phase = 0;   /* 分级声光节奏相位（200ms/拍） */
+static time_t g_zone_last_warn[4] = {0};       /* C2 双阈值：各位置上次预警时间（冷却用） */
+
 static int g_pre_result = DET_RESULT_NONE;  /* 两级管线：当前事件初步结论（FINAL 定案参考） */
 
 /* 云端入侵类型键 → 时间轴用词（server.py 归一：person/animal/object） */
@@ -180,241 +157,186 @@ static const char *det_type_word(const char *key)
 }
 
 /* ================================================================
- * KEY0 设备探测：遍历 /dev/input/eventX，按名字匹配 gpio-keys
- * （gt9147 触摸也是 input 设备，必须用名字过滤避免误绑）
- * 成功返回 fd（已 O_RDONLY|O_NONBLOCK 无所谓，poll 阻塞等待），失败 -1
+ * 领域 → UI 事件（不直接调用 UI）
  * ================================================================ */
-static int find_key_dev(void)
+static void ev_publish(event_type_t type, event_prio_t prio, int source, int code,
+                       const char *text, const char *loc, const char *level)
 {
-    DIR *dir = opendir("/dev/input");
-    if (!dir) return -1;
+    system_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = type;
+    ev.prio = prio;
+    ev.source = source;
+    ev.code = code;
+    if (text)  snprintf(ev.text, sizeof(ev.text), "%s", text);
+    if (loc)   snprintf(ev.loc, sizeof(ev.loc), "%s", loc);
+    if (level) snprintf(ev.level, sizeof(ev.level), "%s", level);
+    event_bus_publish(&ev);
+}
 
-    struct dirent *ent;
-    int found = -1;
-    char path[64];
-    char name[256];
+static void ev_log(const char *title, const char *loc, const char *level)
+{
+    ev_publish(EV_SYS, EV_PRIO_P4, 0, 2, title, loc, level);
+}
 
-    while ((ent = readdir(dir)) != NULL) {
-        if (strncmp(ent->d_name, "event", 5) != 0) continue;
-        snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) continue;
-        memset(name, 0, sizeof(name));
-        if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) >= 0 &&
-            strcmp(name, KEY_DEV_NAME) == 0) {
-            found = fd;
-            break;
-        }
-        close(fd);
-    }
-    closedir(dir);
-    return found;
+static void ev_toast(const char *text)
+{
+    ev_publish(EV_SYS, EV_PRIO_P4, 0, 3, text, NULL, NULL);
+}
+
+static void ev_user_activity(void)
+{
+    ev_publish(EV_SYS, EV_PRIO_P4, 0, 4, NULL, NULL, NULL);
+}
+
+static int camera_zone(void)
+{
+    int z = config_get()->camera_zone;
+    if (z < 0 || z >= 4)
+        z = 0;
+    return z;
 }
 
 /* ================================================================
- * 采集线程：KEY0 poll + 周期读传感器 → 共享状态
+ * T5：告警统一入口
+ *   1) 驱动 alarm_fsm；
+ *   2) 发布 EV_ALARM 到 event_bus；
+ *   3) UI 的 dispatch 定时器统一渲染。
  * ================================================================ */
-static void *collect_thread(void *arg)
+static void bridge_alarm_trigger(int zone, const char *src)
 {
-    (void)arg;
-    int key_fd = find_key_dev();
+    alarm_fsm_dispatch(zone, ALARM_EV_TRIGGER, src);
+    alarm_fsm_dispatch(zone, ALARM_EV_CONFIRM, src);
 
-    /* AP3216C / ICM20608（IIO 框架）：探测设备目录并打开通道属性文件 */
-    char als_path[96] = {0}, imu_path[96] = {0};
-    int als_found = (find_iio_path("ap3216c", als_path, sizeof(als_path)) == 0);
-    int imu_found = (find_iio_path("icm20608", imu_path, sizeof(imu_path)) == 0);
+    system_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = EV_ALARM;
+    ev.prio = EV_PRIO_P1;
+    ev.source = zone;
+    ev.code = 1;
+    snprintf(ev.text, sizeof(ev.text), "%s", src ? src : "");
+    event_bus_publish(&ev);
+}
 
-    int als_als_fd = -1, als_ps_fd = -1, als_ir_fd = -1;
-    int imu_ax_fd = -1, imu_ay_fd = -1, imu_az_fd = -1, imu_t_fd = -1;
-    int als_fd = -1, imu_fd = -1;   /* 综合在位标志（沿用原命名） */
-
-    if (als_found) {
-        /* 属性名以内核 IIO 命名为准（IIO_INTENSITY → in_intensity_*） */
-        als_als_fd = open_iio_attr(als_path, "in_intensity_both_raw");
-        als_ps_fd  = open_iio_attr(als_path, "in_proximity_raw");
-        als_ir_fd  = open_iio_attr(als_path, "in_intensity_ir_raw");
-        als_fd = (als_als_fd >= 0 && als_ps_fd >= 0 && als_ir_fd >= 0) ? 0 : -1;
+/* C1/C5：告警入口。融合开启时登记摄像头事件并推迟定案；关闭时保持即时告警。 */
+static void alarm_or_fuse(int zone, const char *src, int fuse_src)
+{
+    if (g_cfg.fusion_on) {
+        fusion_add(zone, fuse_src, now_ms32(), 55);
+        LOGD("FUSE", "zone=%d %s event queued", zone, src ? src : "?");
+    } else {
+        bridge_alarm_trigger(zone, src);
     }
-    if (imu_found) {
-        imu_ax_fd = open_iio_attr(imu_path, "in_accel_x_raw");
-        imu_ay_fd = open_iio_attr(imu_path, "in_accel_y_raw");
-        imu_az_fd = open_iio_attr(imu_path, "in_accel_z_raw");
-        imu_t_fd  = open_iio_attr(imu_path, "in_temp_raw");
-        imu_fd = (imu_ax_fd >= 0 && imu_ay_fd >= 0 &&
-                  imu_az_fd >= 0 && imu_t_fd >= 0) ? 0 : -1;
-    }
+}
 
-    if (key_fd < 0)
-        printf("[BRIDGE] %s not found (KEY0 disabled; dts key-input okay + insmod key_input.ko?)\n",
-               KEY_DEV_NAME);
-    if (als_fd < 0)
-        printf("[BRIDGE] IIO ap3216c not found (ALS/PS disabled; insmod ap3216c.ko?)\n");
-    if (imu_fd < 0)
-        printf("[BRIDGE] IIO icm20608 not found (IMU disabled; insmod icm20608.ko?)\n");
+static void bridge_alarm_clear(int zone, const char *reason)
+{
+    alarm_fsm_dispatch(zone, ALARM_EV_CLEAR, reason);
 
-    /* 在位标志写入诊断快照 */
-    pthread_mutex_lock(&g_shm.lock);
-    g_shm.key_ok = (key_fd >= 0);
-    g_shm.als_ok = (als_fd >= 0);
-    g_shm.imu_ok = (imu_fd >= 0);
-    pthread_mutex_unlock(&g_shm.lock);
+    system_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = EV_ALARM;
+    ev.prio = EV_PRIO_P1;
+    ev.source = zone;
+    ev.code = 0;
+    snprintf(ev.text, sizeof(ev.text), "%s", reason ? reason : "");
+    event_bus_publish(&ev);
+}
 
-    int tick = 0;
-    int cnt[4] = {0, 0, 0, 0};   /* 各位置去抖计数 */
-
-    while (1) {
-        /* --- KEY0（gpio-keys input 流）：poll 等待（100ms 超时兼作循环节拍） --- */
-        if (key_fd >= 0) {
-            struct pollfd pfd = { .fd = key_fd, .events = POLLIN };
-            if (poll(&pfd, 1, POLL_MS) > 0) {
-                struct input_event ev;
-                /* 每次读一条完整 input_event；EV_KEY+KEY_ARMED+value=1 即按下 */
-                while (read(key_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-                    if (ev.type == EV_KEY && ev.code == KEY_ARMED) {
-                        pthread_mutex_lock(&g_shm.lock);
-                        g_shm.key_level = (ev.value == 1);
-                        if (ev.value == 1)
-                            g_shm.key_toggle++;
-                        pthread_mutex_unlock(&g_shm.lock);
-                    }
-                }
-            }
-        } else {
-            usleep(POLL_MS * 1000);
-        }
-
-        tick++;
-
-        /* ================================================================
-         * 预警判定：每个安防位置按各自配置（触发源+数据通道+阈值）独立判定。
-         * AP3216C 数据 500ms 刷新一次，ICM 数据 200ms 刷新一次；
-         * 数据刷新时对所有引用该传感器的位置做去抖判定。
-         * ================================================================ */
-
-        /* --- AP3216C 数据刷新（IIO sysfs：ALS/PS/IR 三通道） --- */
-        if (als_fd >= 0 && (tick % ALS_PERIOD) == 0) {
-            int als = 0, ps = 0, ir = 0;
-            if (read_iio_int(als_als_fd, &als) == 0 &&
-                read_iio_int(als_ps_fd, &ps) == 0 &&
-                read_iio_int(als_ir_fd, &ir) == 0) {
-
-                pthread_mutex_lock(&g_shm.lock);
-                g_shm.als_ir = ir;
-                g_shm.als_als = als;
-                g_shm.als_ps = ps;
-                int als_en = g_shm.als_en;
-                pthread_mutex_unlock(&g_shm.lock);
-
-                for (int z = 0; z < 4; z++) {
-                    if (!als_en) break;
-                    const struct zone_warn_cfg *c = &g_cfg.zones[z];
-                    if (!c->enabled || c->src != WARN_SRC_AP3216C) continue;
-                    int val = (c->channel == AP_DATA_PS) ? ps :
-                              (c->channel == AP_DATA_ALS) ? als : ir;
-                    int hit = (c->cmp == WARN_CMP_LT) ? (val < c->threshold) :
-                              (c->cmp == WARN_CMP_EQ) ? (val == c->threshold) :
-                              (val > c->threshold);
-                    if (hit) cnt[z]++;
-                    else cnt[z] = 0;
-                    if (cnt[z] >= g_cfg.debounce) {
-                        /* 达到防抖次数：置位一次并重置计数，
-                         * 使数据持续超限时能周期性重新置位（冷却结束后立即可再次触发） */
-                        cnt[z] = 0;
-                        pthread_mutex_lock(&g_shm.lock);
-                        g_shm.warn_hit[z]++;
-                        pthread_mutex_unlock(&g_shm.lock);
-                    }
-                }
-            }
-        }
-
-        /* --- ICM20608 数据刷新（IIO sysfs：accel xyz + temp） --- */
-        if (imu_fd >= 0 && (tick % IMU_PERIOD) == 0) {
-            int ax = 0, ay = 0, az = 0, temp_raw = 0;
-            if (read_iio_int(imu_ax_fd, &ax) == 0 &&
-                read_iio_int(imu_ay_fd, &ay) == 0 &&
-                read_iio_int(imu_az_fd, &az) == 0 &&
-                read_iio_int(imu_t_fd, &temp_raw) == 0) {
-
-                pthread_mutex_lock(&g_shm.lock);
-                g_shm.imu_ax = ax;
-                g_shm.imu_ay = ay;
-                g_shm.imu_az = az;
-                int temp_x10 = (int)((double)temp_raw / 326.8 * 10.0 + 250.0);
-                g_shm.imu_temp_x10 = temp_x10;
-                int imu_en = g_shm.imu_en;
-                pthread_mutex_unlock(&g_shm.lock);
-
-                /* 合加速度 ×100 整数近似：|a| ≈ sqrt(ax²+ay²+az²)/32768×16×100 */
-                double m2 = (double)ax * ax + (double)ay * ay + (double)az * az;
-                long long mag_x100 = (long long)(sqrt(m2) / 32768.0 * 16.0 * 100.0);
-                /* 单轴 ×100 绝对值（AX/AY/AZ 通道用） */
-                long long ax_x100 = llabs((long long)ax * 100 / 2048);
-                long long ay_x100 = llabs((long long)ay * 100 / 2048);
-                long long az_x100 = llabs((long long)az * 100 / 2048);
-
-                for (int z = 0; z < 4; z++) {
-                    if (!imu_en) break;
-                    const struct zone_warn_cfg *c = &g_cfg.zones[z];
-                    if (!c->enabled || c->src != WARN_SRC_ICM) continue;
-                    long long val;
-                    switch (c->channel) {
-                    case IMU_DATA_AX:   val = ax_x100; break;
-                    case IMU_DATA_AY:   val = ay_x100; break;
-                    case IMU_DATA_AZ:   val = az_x100; break;
-                    case IMU_DATA_TEMP: val = temp_x10; break;
-                    default:            val = mag_x100; break;
-                    }
-                    int hit = (c->cmp == WARN_CMP_LT) ? (val < c->threshold) :
-                              (c->cmp == WARN_CMP_EQ) ? (val == c->threshold) :
-                              (val > c->threshold);
-                    if (hit) cnt[z]++;
-                    else cnt[z] = 0;
-                    if (cnt[z] >= g_cfg.debounce) {
-                        /* 达到防抖次数：置位一次并重置计数（同上） */
-                        cnt[z] = 0;
-                        pthread_mutex_lock(&g_shm.lock);
-                        g_shm.warn_hit[z]++;
-                        pthread_mutex_unlock(&g_shm.lock);
-                    }
-                }
-            }
-        }
-    }
-    return NULL;
+/* T10 配置同步等用到单调时钟 */
+static uint32_t now_ms32(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000ULL +
+                      (uint64_t)(ts.tv_nsec / 1000000L));
 }
 
 /* ================================================================
- * LVGL 定时器：主线程消费共享状态 → ui_events_* + 外设控制
+ * 主线程轮询：消费共享状态 → 告警事件 + 外设控制
+ * 由 UI 的 200ms 定时器调用（本层不依赖 LVGL）。
  * ================================================================ */
-static void bridge_timer_cb(lv_timer_t *t)
+void dev_bridge_poll(void)
 {
-    (void)t;
-    int key_toggle, warn_hit[4];
+    /* T8：桥接定时器在主线程运行；心跳停止说明 LVGL 主循环卡死 */
+    health_beat(HEALTH_BRIDGE);
 
-    pthread_mutex_lock(&g_shm.lock);
-    key_toggle = g_shm.key_toggle;  g_shm.key_toggle = 0;
+    /* T10：每 1s 从持久化配置同步一次（远程 set_config/set_warn 无需重启） */
+    static int cfg_sync = 0;
+    if (++cfg_sync >= 5) {
+        cfg_sync = 0;
+        const struct app_config *c = config_get();
+        g_cfg = c->warn;
+        sensor_pipeline_set_config(&g_cfg);
+        sensor_pipeline_set_ap_calib(c->ap_ps_off, c->ap_ir_off,
+                                     c->ap_als_scale ? c->ap_als_scale : 1000);
+        cam_feed_set_motion_interval(c->motion_interval);
+        cam_feed_set_motion_diff(c->motion_diff);
+    }
+
+    /* 采集线程事件（读取即清零） */
+    int key_toggle = sensor_pipeline_take_key_toggle();
+    int calib_done = sensor_pipeline_take_calib_done();
+    int warn_hit[4], warn_pending[4];
     for (int i = 0; i < 4; i++) {
-        warn_hit[i] = g_shm.warn_hit[i];
-        g_shm.warn_hit[i] = 0;
+        warn_hit[i] = sensor_pipeline_take_warn(i);
+        warn_pending[i] = sensor_pipeline_take_warn_pending(i);
     }
-    pthread_mutex_unlock(&g_shm.lock);
 
     /* --- KEY0：屏幕唤醒（重置 UI 空闲计时 + 解除 blank + 事件） --- */
     if (key_toggle > 0) {
-        ui_events_user_activity();   /* 统一入口：g_idle_sec=0 + blank 0 */
-        ui_events_log("KEY 触发", "系统", "");
+        ev_user_activity();   /* 统一入口：g_idle_sec=0 + blank 0 */
+        ev_log("KEY 触发", "系统", "");
     }
 
-    /* --- 各位置预警触发（该分区布防中才生效，带消警冷却） --- */
+    /* --- 零偏校准完成（T3-C，采集线程置标志，主线程上报） --- */
+    if (calib_done > 0) {
+        ev_log("ICM20608 CAL OK", "系统", "");
+        LOGI("CALIB", "zero bias reported to UI");
+    }
+
+    /* --- 传感器数据质量事件（T3-A：故障/恢复/数据陈旧，状态变化才上报） --- */
+    sensor_mgr_check_stale();
+    {
+        sensor_status_t st;
+        char nm[16];
+        while (sensor_mgr_take_fault(NULL, &st, nm, sizeof(nm))) {
+            if (st == SENSOR_OK) {
+                char t[32];
+                snprintf(t, sizeof(t), "%s 正常", nm);
+                ev_log(t, "系统", "");
+                LOGI("SENSOR", "%s recovered", nm);
+            } else {
+                char t[32];
+                snprintf(t, sizeof(t), "%s 异常", nm);
+                ev_log(t, "系统", "medium");
+                LOGW("SENSOR", "%s fault: %s", nm, sensor_status_name(st));
+            }
+        }
+    }
+
+    /* --- C2 双阈值：预警轻提醒（不触发告警状态机/声光，带冷却） --- */
     time_t now = time(NULL);
     for (int i = 0; i < 4; i++) {
+        if (warn_pending[i] <= 0) continue;
+        if (!zone_state_is_armed(i)) continue;
+        if (now - g_zone_last_warn[i] < g_cfg.cooldown_sec) continue;
+        g_zone_last_warn[i] = now;
+        char t[48];
+        snprintf(t, sizeof(t), "%s 传感器预警", zone_state_name(i));
+        ev_toast(t);
+        ev_log(t, "预警", "low");
+        LOGI("BRIDGE", "zone=%d pre-warn (below alarm threshold)", i);
+    }
+
+    /* --- 各位置告警触发（该分区布防中才生效，带消警冷却） --- */
+    for (int i = 0; i < 4; i++) {
         if (warn_hit[i] <= 0) continue;
-        if (!ui_events_zone_is_armed(i)) continue;   /* 分区级布防门槛 */
+        if (!zone_state_is_armed(i)) continue;   /* 分区级布防门槛 */
         /* 冷却：距上次触发 < cooldown_sec 则忽略本次 */
         if (now - g_zone_last_trigger[i] < g_cfg.cooldown_sec) continue;
         g_zone_last_trigger[i] = now;
-        ui_events_alarm_trigger_src(i, "SENSOR");
+        bridge_alarm_trigger(i, "SENSOR");
     }
 
     /* --- 运动粗判命中（当前预览通道对应分区，布防中+冷却） ---
@@ -423,8 +345,8 @@ static void bridge_timer_cb(lv_timer_t *t)
      * 云端复核定案），结论经下方轮询分发 */
     int mh = cam_feed_get_motion_hits();
     if (mh > 0) {
-        int z = ui_events_current_cam_zone();
-        if (z >= 0 && ui_events_zone_is_armed(z)
+        int z = camera_zone();
+        if (z >= 0 && zone_state_is_armed(z)
             && now - g_zone_last_trigger[z] >= g_cfg.cooldown_sec) {
             g_zone_last_trigger[z] = now;
             detector_submit(z);
@@ -448,39 +370,39 @@ static void bridge_timer_cb(lv_timer_t *t)
          * 初判告警后分区已转 ZONE_ALARM（非 ARMED），若按布防门槛拦截，
          * 云端白名单/无人结论永远到不了自动消警逻辑（08-30 板测定位）；
          * 撤防（OFFLINE）后两种结论都丢弃 */
-        if (take && rst == DET_STAGE_INITIAL && !ui_events_zone_is_armed(rz))
+        if (take && rst == DET_STAGE_INITIAL && !zone_state_is_armed(rz))
             take = 0;
         if (take && rst == DET_STAGE_FINAL
-            && !ui_events_zone_is_armed(rz) && !ui_events_zone_is_alarm(rz))
+            && !zone_state_is_armed(rz) && !zone_state_has_alarm(rz))
             take = 0;
 
         if (take) {
             if (rst == DET_STAGE_INITIAL) {
                 g_pre_result = rr;   /* 暂存初步结论（FINAL 定案时参考） */
                 if (rr == DET_RESULT_FACE_UNKNOWN) {
-                    ui_events_alarm_trigger_src(rz, "STRANGER");   /* 立即告警 */
+                    alarm_or_fuse(rz, "STRANGER", FUSE_SRC_CAM);   /* 融合开启则登记待定案 */
                 } else if (rr == DET_RESULT_NO_FACE) {
-                    if (ui_events_cloud_review_on()) {
+                    if (config_get()->cloud_review) {
                         /* 轻提醒不打扰：未检出人脸（可能是光影，也可能人背对镜头），等云端定论 */
-                        ui_events_toast("画面变动");
-                        ui_events_log("画面变动（未检出人员）", "本地初判", "low");
+                        ev_toast("画面变动");
+                        ev_log("画面变动（未检出人员）", "本地初判", "low");
                     } else {
-                        ui_events_alarm_trigger_src(rz, "INTRUDER");
+                        alarm_or_fuse(rz, "INTRUDER", FUSE_SRC_CAM);
                     }
                 }
             } else {   /* DET_STAGE_FINAL：云端复核定案 */
                 const char *tw = det_type_word(name);
                 switch (rr) {
                 case DET_RESULT_FACE_KNOWN: {   /* 白名单命中：误告警自动撤销 */
-                    if (ui_events_zone_is_alarm(rz))
-                        ui_events_alarm_auto_clear(rz, "云端复核：已授权人员");
+                    if (zone_state_has_alarm(rz))
+                        bridge_alarm_clear(rz, "云端复核：已授权人员");
                     else
-                        ui_events_log("云端复核：已授权人员", "云端复核", "low");
+                        ev_log("云端复核：已授权人员", "云端复核", "low");
                     break;
                 }
                 case DET_RESULT_FACE_UNKNOWN: { /* 云端陌生人：不在告警则升级（如背身人形） */
-                    if (!ui_events_zone_is_alarm(rz))
-                        ui_events_alarm_trigger_src(rz, "STRANGER");
+                    if (!zone_state_has_alarm(rz))
+                        alarm_or_fuse(rz, "STRANGER", FUSE_SRC_CAM);
                     break;
                 }
                 case DET_RESULT_OTHER: {        /* 云端判定非人员：本地误报则撤销 */
@@ -489,15 +411,15 @@ static void bridge_timer_cb(lv_timer_t *t)
                         snprintf(t, sizeof(t), "云端复核：判定为%s活动", tw);
                     else
                         snprintf(t, sizeof(t), "云端复核：判定无人员");
-                    if (ui_events_zone_is_alarm(rz))
-                        ui_events_alarm_auto_clear(rz, t);
+                    if (zone_state_has_alarm(rz))
+                        bridge_alarm_clear(rz, t);
                     else
-                        ui_events_log(t, "云端复核", "low");
+                        ev_log(t, "云端复核", "low");
                     break;
                 }
                 default: {                      /* 云端不可达：维持/升级本地结论（fail-safe） */
-                    if (g_pre_result == DET_RESULT_NO_FACE && !ui_events_zone_is_alarm(rz))
-                        ui_events_alarm_trigger_src(rz, "INTRUDER");
+                    if (g_pre_result == DET_RESULT_NO_FACE && !zone_state_has_alarm(rz))
+                        alarm_or_fuse(rz, "INTRUDER", FUSE_SRC_CAM);
                     break;
                 }
                 }
@@ -505,59 +427,39 @@ static void bridge_timer_cb(lv_timer_t *t)
         }
     }
 
-    /* --- 告警分级声光（设计 2.2：高=快闪+长鸣 中=中闪+断鸣 低=慢闪+短鸣） ---
-     * 级别：3=高（窗/周界）2=中（仓库）1=低（门）0=无告警
-     * 节拍 200ms：高=LED 每拍翻+持续鸣；中=LED 2 拍翻+2 拍鸣/2 拍停；低=LED 4 拍翻+1 拍鸣/3 拍停 */
-    int alarm_lvl = ui_events_zone_alarm_level();
+    /* --- C1/C5：多源融合定案（fusion_on=1 时启作用） ---
+     * 摄像头与传感器事件在时间窗内共现 → 置信度达标 → 告警；
+     * 单源事件窗口过期仍未达阈值 → 只记轻事件，不告警。 */
+    if (g_cfg.fusion_on) {
+        uint32_t win = (g_cfg.fusion_window_ms > 0)
+                           ? (uint32_t)g_cfg.fusion_window_ms : 3000u;
+        int fz, fsc;
+        while ((fz = fusion_poll(now_ms32(), win, g_cfg.fusion_threshold, &fsc)) >= 0) {
+            if (!zone_state_is_armed(fz) && !zone_state_has_alarm(fz))
+                continue;   /* 未布防：直接丢弃 */
 
-    if (g_led_fd >= 0) {
-        if (alarm_lvl > 0) {
-            static int blink = 0;
-            blink++;
-            int period = (alarm_lvl >= 3) ? 1 : (alarm_lvl == 2 ? 2 : 4);
-            int led = (blink / 2) % period ? 0 : 1;   /* 按级别周期翻转 */
-            if (led != g_led_on) {
-                ioctl(g_led_fd, led ? LED_IOC_ON : LED_IOC_OFF);
-                g_led_on = led;
-            }
-        } else {
-            /* 无告警：跟随布防状态（布防亮） */
-            int on = ui_events_is_armed();
-            if (on != g_led_on) {
-                ioctl(g_led_fd, on ? LED_IOC_ON : LED_IOC_OFF);
-                g_led_on = on;
+            if (fsc >= g_cfg.fusion_threshold &&
+                now - g_zone_last_trigger[fz] >= g_cfg.cooldown_sec) {
+                g_zone_last_trigger[fz] = now;
+                LOGI("FUSE", "zone=%d score=%d -> ALARM", fz, fsc);
+                bridge_alarm_trigger(fz, "FUSION");
+            } else {
+                LOGI("FUSE", "zone=%d score=%d -> single-source", fz, fsc);
+                ev_log("单源事件（未达融合阈值）", "融合判定", "low");
             }
         }
     }
 
-    /* --- 蜂鸣器：分级鸣叫节奏（静音挂起时只停不响，消警自动解除静音） --- */
-    if (g_beep_fd >= 0) {
-        if (g_beep_muted && alarm_lvl == 0)
-            g_beep_muted = 0;   /* 告警解除，自动恢复跟随 */
+    /* 事件总线由 UI 的 dispatch 定时器统一消费（本层只负责发布） */
 
-        if (!g_beep_muted && alarm_lvl > 0) {
-            g_snd_phase++;
-            int beep = 1;                                        /* 高：持续长鸣 */
-            if (alarm_lvl == 2) beep = (g_snd_phase / 2) % 2;    /* 中：400ms 鸣/停 */
-            if (alarm_lvl == 1) beep = (g_snd_phase % 4) == 0;   /* 低：200ms 短鸣/600ms 停 */
+    /* --- 告警分级声光（策略在 domain/alarm/warn_policy，输出在 infra/hal_io） ---
+     * 级别：3=高（窗/周界）2=中（仓库）1=低（门）0=无告警 */
+    warn_policy_step(&g_warn, zone_state_alarm_level(), zone_state_any_armed());
 
-            if (beep != g_beep_on) {
-                if (lseek(g_beep_fd, 0, SEEK_SET) >= 0) {
-                    char c = beep ? '1' : '0';
-                    if (write(g_beep_fd, &c, 1) < 0)
-                        perror("[BRIDGE] beep write");
-                }
-                g_beep_on = beep;
-            }
-        } else if (g_beep_on != 0) {
-            if (lseek(g_beep_fd, 0, SEEK_SET) >= 0) {
-                char c = '0';
-                if (write(g_beep_fd, &c, 1) < 0)
-                    perror("[BRIDGE] beep write");
-            }
-            g_beep_on = 0;
-        }
-    }
+    if (hal_io_led_ok())
+        hal_io_led_write(warn_policy_led(&g_warn));
+    if (hal_io_beep_ok())
+        hal_io_beep_write(warn_policy_beep(&g_warn));
 }
 
 /* ================================================================
@@ -568,32 +470,45 @@ void dev_bridge_start(void)
     if (g_started) return;
     g_started = 1;
 
-    /* 控制输出节点（失败仅禁用该外设） */
-    g_led_fd = open(DEV_LED, O_RDWR);
-    if (g_led_fd < 0)
-        printf("[BRIDGE] %s open failed: %s (LED follow disabled)\n", DEV_LED, strerror(errno));
-    g_beep_fd = open(DEV_BEEP, O_WRONLY);
-    if (g_beep_fd < 0)
-        printf("[BRIDGE] %s open failed: %s (beep follow disabled)\n", DEV_BEEP, strerror(errno));
-    g_pwm_fd = open(DEV_PWM, O_RDWR);   /* 仅探测在位（诊断面板显示） */
-    g_led_on = g_beep_on = -1;
+    /* 从持久化配置恢复预警阈值（config 未初始化时在此兜底，兼容模拟器入口） */
+    if (!config_path()[0])
+        config_init(NULL);
+    g_cfg = config_get()->warn;
+    g_cfg_loaded = 1;
+    {
+        const struct app_config *c = config_get();
+        sensor_pipeline_set_config(&g_cfg);
+        sensor_pipeline_set_ap_calib(c->ap_ps_off, c->ap_ir_off,
+                                     c->ap_als_scale ? c->ap_als_scale : 1000);
+    }
 
-    /* 传感器采集默认开启 */
-    pthread_mutex_lock(&g_shm.lock);
-    g_shm.als_en = 1;
-    g_shm.imu_en = 1;
-    pthread_mutex_unlock(&g_shm.lock);
+    /* T5：事件总线 + 告警状态机 */
+    event_bus_init();
+    alarm_fsm_init();
 
-    /* 采集线程 */
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, collect_thread, NULL) != 0) {
-        printf("[BRIDGE] collect thread create failed\n");
+    /* T3-A：传感器数据质量管理（滤波/异常剔除/故障状态） */
+    sensor_mgr_init();
+    /* T3-C：加载校准参数（config_init 已完成），可选上电零偏采集 */
+    sensor_calib_init();
+
+    if (getenv("GATEWAY_CALIB_ONCE")) {
+        sensor_calib_start_zero_bias(2000);
+        LOGI("CALIB", "GATEWAY_CALIB_ONCE set: keep device still for 2s");
+    }
+
+    /* 控制输出节点（失败仅禁用该外设，见 infra/hal_io） */
+    warn_policy_reset(&g_warn);
+    if (hal_io_open() != 0)
+        LOGW("BRIDGE", "no output device available (LED/beep disabled)");
+
+    /* 采集流水线（KEY0 + AP3216C + ICM20608，线程在 infra/sensor_pipeline） */
+    if (sensor_pipeline_start() != 0) {
+        LOGE("BRIDGE", "sensor pipeline start failed");
         return;
     }
-    pthread_detach(tid);
 
     /* LVGL 主线程消费定时器（200ms） */
-    lv_timer_create(bridge_timer_cb, 200, NULL);
+    /* 定时器已移到 UI 层（dev_bridge_poll），本层不再依赖 LVGL */
     detector_init();
 
     /* --- 功能初始化就绪上报（时间轴，开机一次） ---
@@ -603,18 +518,28 @@ void dev_bridge_start(void)
      * 云端复核：仅当"云端复核"开关开启时探测服务可达性——
      *   可达 → "云端复核 已就绪"；不可达 → "云端复核 不可达（本地兜底）"（告警级）。 */
     if (detector_model_ready() == 0)
-        ui_events_log("本地人脸识别 已就绪", "本地初判", "");
+        ev_log("本地人脸识别 已就绪", "本地初判", "");
     else
-        ui_events_log("本地模型未加载（降级-只判有运动）", "本地初判", "medium");
+        ev_log("本地模型未加载（降级-只判有运动）", "本地初判", "medium");
 
-    if (ui_events_cloud_review_on()) {
+    if (config_get()->cloud_review) {
         if (cloud_detect_ready() == 0)
-            ui_events_log("云端复核 已就绪", "云端", "");
+            ev_log("云端复核 已就绪", "云端", "");
         else
-            ui_events_log("云端复核 不可达（本地兜底）", "云端", "medium");
+            ev_log("云端复核 不可达（本地兜底）", "云端", "medium");
     }
 
-    printf("[BRIDGE] device bridge started\n");
+    LOGI("BRIDGE", "device bridge started");
+}
+
+/* T5-B：停止采集/IMU 线程并 join（退出流程调用；采集线程 poll 上限 100ms，
+ * IMU 线程 poll 上限 200ms，所以通常 <300ms 返回） */
+void dev_bridge_stop(void)
+{
+    sensor_pipeline_stop();
+    hal_io_close();
+
+    LOGI("BRIDGE", "device bridge stopped");
 }
 
 /* ================================================================
@@ -625,29 +550,16 @@ void dev_bridge_get_diag(struct dev_diag *out)
     if (!out) return;
     memset(out, 0, sizeof(*out));
 
-    pthread_mutex_lock(&g_shm.lock);
-    out->key_ok      = g_shm.key_ok;
-    out->als_ok      = g_shm.als_ok;
-    out->imu_ok      = g_shm.imu_ok;
-    out->key_pressed = g_shm.key_level ? 1 : 0;
-    out->als_ir      = g_shm.als_ir;
-    out->als_als     = g_shm.als_als;
-    out->als_ps      = g_shm.als_ps;
-    out->imu_ax      = g_shm.imu_ax;
-    out->imu_ay      = g_shm.imu_ay;
-    out->imu_az      = g_shm.imu_az;
-    out->imu_temp_x10 = g_shm.imu_temp_x10;
-    out->als_en      = g_shm.als_en;
-    out->imu_en      = g_shm.imu_en;
-    pthread_mutex_unlock(&g_shm.lock);
+    sensor_pipeline_get_diag(out);
 
-    out->led_ok   = (g_led_fd >= 0);
-    out->beep_ok  = (g_beep_fd >= 0);
-    out->pwm_ok   = (g_pwm_fd >= 0);
-    out->pwm_on   = g_pwm_on_cur;
-    out->pwm_freq = (g_pwm_fd >= 0) ? g_pwm_freq_cur : 0;
-    out->led_on   = (g_led_on == 1);
-    out->beep_on  = (g_beep_on == 1);
+
+    out->led_ok   = hal_io_led_ok();
+    out->beep_ok  = hal_io_beep_ok();
+    out->pwm_ok   = hal_io_pwm_ok();
+    out->pwm_on   = hal_io_pwm_state();
+    out->pwm_freq = hal_io_pwm_ok() ? hal_io_pwm_freq() : 0;
+    out->led_on   = (hal_io_led_state() == 1);
+    out->beep_on  = (hal_io_beep_state() == 1);
 }
 
 /* ================================================================
@@ -656,12 +568,22 @@ void dev_bridge_get_diag(struct dev_diag *out)
 void dev_bridge_get_config(struct dev_config *out)
 {
     if (!out) return;
+    /* UI 设置弹窗在 dev_bridge_start 之前构建：首次读取时从持久化配置恢复，
+     * 保证重启后显示的是上次保存的阈值，而不是编译期默认值。 */
+    if (!g_cfg_loaded && config_path()[0]) {
+        g_cfg = config_get()->warn;
+        g_cfg_loaded = 1;
+    }
     *out = g_cfg;
 }
 
 void dev_bridge_set_config(const struct dev_config *cfg)
 {
     if (!cfg) return;
+    if (!g_cfg_loaded && config_path()[0]) {
+        g_cfg = config_get()->warn;
+        g_cfg_loaded = 1;
+    }
     g_cfg = *cfg;   /* 整表替换（UI 侧先 get 再改再 set） */
     if (g_cfg.debounce < 1) g_cfg.debounce = 1;
     if (g_cfg.debounce > 20) g_cfg.debounce = 20;
@@ -671,86 +593,108 @@ void dev_bridge_set_config(const struct dev_config *cfg)
         if (g_cfg.zones[i].src < WARN_SRC_NONE) g_cfg.zones[i].src = WARN_SRC_NONE;
         if (g_cfg.zones[i].src > WARN_SRC_ICM) g_cfg.zones[i].src = WARN_SRC_ICM;
     }
+    sensor_pipeline_set_config(&g_cfg);
+
+    /* 持久化：只更新内存并置 dirty，由 UI 的 1s 定时器统一 flush，
+     * 避免滑条拖动时频繁写盘（TF/rootfs 写放大与 UI 卡顿）。 */
+    struct app_config ac = *config_get();
+    ac.warn = g_cfg;
+    config_update(&ac);
+}
+
+/* AP3216C 校准（环境基线 + 光照比例）：立即生效并持久化 */
+void dev_bridge_set_ap_calib(int ps_off, int ir_off, int als_scale_x1000)
+{
+    if (als_scale_x1000 < 500) als_scale_x1000 = 500;
+    if (als_scale_x1000 > 2000) als_scale_x1000 = 2000;
+    if (ps_off < -2048) ps_off = -2048;
+    if (ps_off > 2048) ps_off = 2048;
+    if (ir_off < -2048) ir_off = -2048;
+    if (ir_off > 2048) ir_off = 2048;
+
+    sensor_pipeline_set_ap_calib(ps_off, ir_off, als_scale_x1000);
+
+    struct app_config ac = *config_get();
+    ac.ap_ps_off = ps_off;
+    ac.ap_ir_off = ir_off;
+    ac.ap_als_scale = als_scale_x1000;
+    config_update(&ac);
+    config_flush();
+    LOGI("BRIDGE", "AP3216C calib: ps_off=%d ir_off=%d als_scale=%d",
+         ps_off, ir_off, als_scale_x1000);
+}
+
+void dev_bridge_get_ap_calib(int *ps_off, int *ir_off, int *als_scale_x1000)
+{
+    sensor_pipeline_get_ap_calib(ps_off, ir_off, als_scale_x1000);
+}
+
+int dev_bridge_get_cooldown_remain(int zone)
+{
+    if (zone < 0 || zone >= 4)
+        return 0;
+    int cd = g_cfg.cooldown_sec;
+    if (cd <= 0)
+        return 0;
+    time_t now = time(NULL);
+    int elapsed = (int)(now - g_zone_last_trigger[zone]);
+    if (elapsed < 0)
+        elapsed = 0;
+    int remain = cd - elapsed;
+    return remain > 0 ? remain : 0;
 }
 
 /* ================================================================
  * 测试面板手动控制
  * ================================================================ */
 
-/* 手动开关板载蜂鸣器（同步 g_beep_on 缓存，避免与告警跟随逻辑冲突） */
+/* 手动开关板载蜂鸣器：锁定状态，直到再次点击（告警时自动让位） */
 void dev_bridge_set_beep(int on)
 {
-    if (g_beep_fd >= 0) {
-        if (lseek(g_beep_fd, 0, SEEK_SET) >= 0) {
-            char c = on ? '1' : '0';
-            if (write(g_beep_fd, &c, 1) < 0)
-                perror("[BRIDGE] beep write");
-        }
-    }
-    g_beep_on = on ? 1 : 0;
+    warn_policy_set_beep_manual(&g_warn, on);
+    hal_io_beep_write(on);
+}
+
+/* 手动开关板载 LED：锁定状态，直到再次点击（告警时自动让位） */
+void dev_bridge_set_led(int on)
+{
+    warn_policy_set_led_manual(&g_warn, on);
+    hal_io_led_write(on);
 }
 
 /* 手动开关 PWM 蜂鸣器并设置频率（beep_pwm ioctl） */
 void dev_bridge_set_pwm(int on, int freq)
 {
-    if (g_pwm_fd < 0) return;
-    if (freq < 100) freq = 100;
-    if (freq > 20000) freq = 20000;
-
-    if (on) {
-        int f = freq, d = 50;
-        ioctl(g_pwm_fd, BEEP_IOC_SET_FREQ, &f);
-        ioctl(g_pwm_fd, BEEP_IOC_SET_DUTY, &d);
-        ioctl(g_pwm_fd, BEEP_IOC_ON);
-    } else {
-        ioctl(g_pwm_fd, BEEP_IOC_OFF);
-    }
-    g_pwm_on_cur = on ? 1 : 0;   /* 记录开关状态（诊断显示） */
-    g_pwm_freq_cur = freq;       /* 记录当前频率（诊断显示） */
+    if (!hal_io_pwm_ok()) return;
+    /* 手动调速默认 30% 占空比：
+     * 50% 时无源蜂鸣器电流脉冲最大，会通过电源/振动干扰 OV5640，
+     * 表现为抓拍照片出现行错位（不是显示撕裂）。 */
+    hal_io_pwm_write(on, freq, 30);
 }
 
 void dev_bridge_set_beep_mute(int mute)
 {
-    g_beep_muted = mute ? 1 : 0;
-    if (g_beep_muted && g_beep_fd >= 0 && g_beep_on != 0) {
-        /* 立即静音 */
-        if (lseek(g_beep_fd, 0, SEEK_SET) >= 0) {
-            char c = '0';
-            if (write(g_beep_fd, &c, 1) < 0)
-                perror("[BRIDGE] beep mute write");
-        }
-        g_beep_on = 0;
-    }
+    warn_policy_set_mute(&g_warn, mute);
+    if (hal_io_beep_ok())
+        hal_io_beep_write(warn_policy_beep(&g_warn));   /* 静音立即生效 */
 }
 
 void dev_bridge_set_als_en(int en)
 {
-    pthread_mutex_lock(&g_shm.lock);
-    g_shm.als_en = en ? 1 : 0;
-    pthread_mutex_unlock(&g_shm.lock);
+    sensor_pipeline_set_als_en(en);
 }
 
 void dev_bridge_set_imu_en(int en)
 {
-    pthread_mutex_lock(&g_shm.lock);
-    g_shm.imu_en = en ? 1 : 0;
-    pthread_mutex_unlock(&g_shm.lock);
+    sensor_pipeline_set_imu_en(en);
 }
 
 int dev_bridge_get_als_en(void)
 {
-    int v;
-    pthread_mutex_lock(&g_shm.lock);
-    v = g_shm.als_en;
-    pthread_mutex_unlock(&g_shm.lock);
-    return v;
+    return sensor_pipeline_get_als_en();
 }
 
 int dev_bridge_get_imu_en(void)
 {
-    int v;
-    pthread_mutex_lock(&g_shm.lock);
-    v = g_shm.imu_en;
-    pthread_mutex_unlock(&g_shm.lock);
-    return v;
+    return sensor_pipeline_get_imu_en();
 }

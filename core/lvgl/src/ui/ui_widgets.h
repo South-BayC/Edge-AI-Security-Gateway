@@ -64,4 +64,16 @@ lv_obj_t *uiw_op_btn(lv_obj_t *par, const char *txt,
  */
 lv_obj_t *uiw_modal_create(lv_obj_t *parent, const char *title, int w);
 
+/** 中文标签（使用 UI 补充字库 FONT_UI） */
+lv_obj_t *uiw_label_cn(lv_obj_t *par, const char *txt, uint32_t hex);
+
+/**
+ * 小尺寸描边按钮（设置/检测页常用）
+ * @param par 父对象
+ * @param txt 文案
+ * @param clr 边框+文字颜色
+ * @param cb  点击回调（可为 NULL）
+ */
+lv_obj_t *uiw_mini_btn(lv_obj_t *par, const char *txt, uint32_t clr, lv_event_cb_t cb);
+
 #endif /* UI_WIDGETS_H */

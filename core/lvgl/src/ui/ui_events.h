@@ -14,7 +14,7 @@
 #ifndef UI_EVENTS_H
 #define UI_EVENTS_H
 
-#include "../state_machine.h"   /* zone_state_t: ZONE_ONLINE / ZONE_ARMED / ZONE_ALARM / ZONE_OFFLINE */
+#include "../zone_types.h"   /* zone_state_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,7 +85,7 @@ void ui_events_toast(const char *text);
 /**
  * 事件时间轴追加（任何系统事件入口）
  * @param title 事件标题（须为 SHSC_16 字库内字符，否则显示方框）
- * @param loc   位置（"前门"/"主控"/"云端"/"CH01" 等）
+ * @param loc   位置（"前门"/"主控"/"云端" 等）
  * @param level 级别："" / "high" / "medium" / "low"
  * 自动插入时间轴顶部、更新计数（最多保留 25 条）。
  */
@@ -127,11 +127,18 @@ int ui_events_zone_has_armed(void);
 int ui_events_zone_is_armed(int id);
 
 /**
- * 查询当前预览通道对应的分区索引（单摄分时切换语义）
- * @return 分区索引 0-3；异常返回 -1
- * 运动粗判命中时，告警归属当前预览通道对应的分区
+ * 查询摄像头归属的防区索引（单摄固定安装）
+ * @return 分区索引 0-3（来自配置 camera_zone）
+ * 摄像头运动/精判结论统一归属该分区，不再按通道切换
  */
 int ui_events_current_cam_zone(void);
+
+/**
+ * 查询分区显示名（中文，用于预警/日志文案）
+ * @param id 分区索引 0-3
+ * @return 名称字符串；越界返回空串
+ */
+const char *ui_events_zone_name(int id);
 
 /**
  * 查询是否有任一分区处于告警（外设联动用，如蜂鸣器）
@@ -145,6 +152,13 @@ int ui_events_zone_has_alarm(void);
  * 映射按设计文档 2.2：门=低、仓库=中、窗/周界=高；多分区同时告警取最高
  */
 int ui_events_zone_alarm_level(void);
+
+/**
+ * 远程配置变更：重新读取 config 并刷新 UI
+ * （云端复核开关/亮度/定时布防/检测参数）
+ * 由 dev_bridge 在主线程收到 EV_SYS(code=1) 时调用。
+ */
+void ui_events_config_changed(void);
 
 /**
  * 用户活动通知（触摸/按键唤醒统一入口）

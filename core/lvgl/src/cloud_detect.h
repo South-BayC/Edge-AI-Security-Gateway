@@ -29,6 +29,9 @@ extern "C" {
  */
 void cloud_detect_set_server(const char *ipport);
 
+/** 设置 HTTP 请求头 X-API-Key（云端鉴权，T11-B2）；空串=不携带 */
+void cloud_detect_set_api_key(const char *key);
+
 /**
  * 云端复核服务可达性探测（开机就绪上报用）
  * 向云端服务发起一次轻量 TCP 连接（非阻塞 connect + select 超时），

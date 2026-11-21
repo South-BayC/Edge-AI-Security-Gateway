@@ -9,8 +9,10 @@
  * 满卡策略: 剩余 < STORAGE_KEEP_MB 时按 mtime 删最旧 snap_*.bmp 后重试一次
  */
 #include "storage_mgr.h"
+#include "log_svc.h"
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -128,7 +130,7 @@ int storage_snap_save(const uint16_t *pix, int w, int h,
 
     FILE *fp = fopen(path, "wb");
     if (!fp) {
-        perror("[STORAGE] bmp open");
+        LOGE("STORAGE", "bmp open: %s", strerror(errno));
         return -1;
     }
 
@@ -159,7 +161,7 @@ int storage_snap_save(const uint16_t *pix, int w, int h,
     }
 
     fclose(fp);
-    printf("[STORAGE] saved %s (%uKB)\n", path, file_size / 1024);
+    LOGI("STORAGE", "saved %s (%uKB)", path, file_size / 1024);
     return 0;
 }
 

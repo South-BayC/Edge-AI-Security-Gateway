@@ -26,8 +26,28 @@ NCNN_DIR := ../../third_party/ncnn-armhf
 DET_CPP := src/detector.cpp
 OBJS    += $(BUILD_CACHE_LVGL)/$(DET_CPP:.cpp=.o)
 
-CFLAGS  := -std=gnu99 -I$(CURDIR) -I$(LVGL_DIR) -I$(LVGL_DIR)/src -O2 -Wall -Wextra -DLV_CONF_INCLUDE_SIMPLE -DLV_LVGL_H_INCLUDE_SIMPLE
-LDFLAGS := -lm -lpthread -lstdc++ -L$(CURDIR)/$(NCNN_DIR)/lib -lncnn
+# T11-③：mbedTLS（可选）。检测到静态库时自动启用 TLS，否则仍可编 1883 明文版。
+MBEDTLS_DIR ?= ../../third_party/mbedtls-armhf
+ifneq ($(wildcard $(MBEDTLS_DIR)/lib/libmbedtls.a),)
+TLS_CFLAGS := -DMQTT_TLS -I$(MBEDTLS_DIR)/include
+TLS_LIBS   := -L$(MBEDTLS_DIR)/lib -lmbedtls -lmbedx509 -lmbedcrypto
+else
+TLS_CFLAGS :=
+TLS_LIBS   :=
+endif
+
+CFLAGS  := -std=gnu99 -I$(CURDIR) -I$(CURDIR)/src -I$(LVGL_DIR) -I$(LVGL_DIR)/src -O2 -Wall -Wextra -DLV_CONF_INCLUDE_SIMPLE -DLV_LVGL_H_INCLUDE_SIMPLE -MMD -MP $(TLS_CFLAGS)
+LDFLAGS := -lm -lpthread -lstdc++ -L$(CURDIR)/$(NCNN_DIR)/lib -lncnn $(TLS_LIBS)
+
+# LVGL 自带源码的 -Wtype-limits 噪声（calendar 等第三方代码），仅对 lvgl/ 下目标屏蔽
+$(BUILD_CACHE_LVGL)/lvgl/%.o: CFLAGS += -Wno-type-limits
+
+# 自动头文件依赖：任何 .h 变化都会触发依赖它的 .c/.cpp 重编
+# （此前只跟踪 lv_conf.h，改结构体头文件后旧 .o 会造成 ABI 不一致）
+# 注意：-include 必须在 .DEFAULT_GOAL 之后（否则 .d 里的目标会被当成默认目标）
+.DEFAULT_GOAL := all
+DEPS := $(OBJS:.o=.d)
+-include $(DEPS)
 
 all: $(TARGET)
 	@echo "LVGL gateway built: $(TARGET)  ($$(du -h $(TARGET) 2>/dev/null | cut -f1))"
@@ -53,7 +73,7 @@ $(BUILD_CACHE_LVGL)/src/detector.o: $(DET_CPP) $(CURDIR)/lv_conf.h $(NCNN_DIR)/i
 	@mkdir -p $(dir $@)
 	arm-linux-gnueabihf-g++ -std=c++11 -I$(CURDIR) -I$(LVGL_DIR) -I$(LVGL_DIR)/src \
 	       -I$(CURDIR)/$(NCNN_DIR)/include \
-	       -O2 -Wall -mfpu=neon -DLV_CONF_INCLUDE_SIMPLE -DLV_LVGL_H_INCLUDE_SIMPLE -c $< -o $@
+	       -O2 -Wall -mfpu=neon -DLV_CONF_INCLUDE_SIMPLE -DLV_LVGL_H_INCLUDE_SIMPLE -MMD -MP -c $< -o $@
 
 # 模拟器（SDL，宿主机）
 SIM_TARGET := $(BUILD_LVGL_DIR)/lvgl_sim

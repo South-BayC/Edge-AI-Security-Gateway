@@ -1,4 +1,4 @@
-/**
+﻿/**
  * cam_feed.h — 摄像头画面喂数（V4L2 → LVGL canvas）
  *
  * 架构（线程安全，双缓冲消撕裂）:
@@ -15,7 +15,7 @@
 #ifndef CAM_FEED_H
 #define CAM_FEED_H
 
-#include "lvgl/lvgl.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,7 +32,12 @@ extern "C" {
  * @param buf    canvas 缓冲指针（调用方持有，本模块直写）
  * 内部探测 /dev/video0；失败则打印警告并保持禁用。
  */
-void cam_feed_start(lv_obj_t *canvas, uint8_t *buf);
+void cam_feed_start(uint8_t *buf);
+
+/**
+ * 停止采集线程并 join（进程退出/重启摄像头前调用）
+ */
+void cam_feed_stop(void);
 
 /**
  * 查询是否有新完成帧并拷入 canvas 缓冲（UI 定时器轮询）
@@ -99,6 +104,18 @@ int  cam_feed_get_motion_interval(void);
  */
 void cam_feed_set_motion_diff(int d);
 int  cam_feed_get_motion_diff(void);
+
+/* T4：背景建模/形态学参数（默认 0.05 / 20 / 15，后续可接设置页） */
+void cam_feed_set_motion_bg_alpha(int x1000);   /* 背景更新系数 ×1000，1~500 */
+int  cam_feed_get_motion_bg_alpha(void);
+void cam_feed_set_motion_min_area(int v);       /* 连通域最小面积，1~500 */
+int  cam_feed_get_motion_min_area(void);
+void cam_feed_set_motion_light_jump(int pct);   /* 全局亮度突变阈值 %，1~100 */
+int  cam_feed_get_motion_light_jump(void);
+
+/* C4：ROI 与阴影抑制（百分比 0~100；全幅表示关闭 ROI） */
+void cam_feed_set_roi(int x0, int y0, int x1, int y1);
+void cam_feed_set_shadow_suppress(int en);
 
 #ifdef __cplusplus
 }

@@ -23,6 +23,10 @@ extern "C" {
  * 内部创建采集线程 + LVGL 消费定时器；重复调用无副作用。
  */
 void dev_bridge_start(void);
+/** 停止采集/IMU 线程并 join（退出流程调用） */
+void dev_bridge_stop(void);
+/** 主线程轮询（UI 每 200ms 调用）：消费共享状态、驱动告警/声光 */
+void dev_bridge_poll(void);
 
 /**
  * 模块诊断信息快照（供 UI 检测面板显示）
@@ -42,6 +46,9 @@ struct dev_diag {
     /* ICM20608 最新原始值（±16G 量程）与温度（℃×10） */
     int imu_ax, imu_ay, imu_az;
     int imu_temp_x10;
+    /* C2：合加速度瞬时值 + 滑窗统计（×100，1g≈100） */
+    int imu_mag_x100, imu_rms_x100, imu_peak_x100;
+    int imu_lin_x100;   /* C3：线性加速度（去重力）×100 */
     /* 采集使能（测试面板手动开关） */
     int als_en, imu_en;
 };
@@ -52,49 +59,20 @@ struct dev_diag {
  */
 void dev_bridge_get_diag(struct dev_diag *out);
 
-/* ---- 预警触发源 / 数据通道枚举 ---- */
-#define WARN_SRC_NONE    0   /* 不触发 */
-#define WARN_SRC_AP3216C 1
-#define WARN_SRC_ICM     2
-
-/* AP3216C 数据通道（src=WARN_SRC_AP3216C 时使用） */
-#define AP_DATA_PS       0   /* 距离（越大越近） */
-#define AP_DATA_ALS      1   /* 光照 */
-#define AP_DATA_IR       2   /* 红外 */
-
-/* ICM20608 数据通道（src=WARN_SRC_ICM 时使用）
- * MAG = 合加速度模长 sqrt(ax²+ay²+az²) ×100（三轴矢量和，非平均值） */
-#define IMU_DATA_MAG     0   /* 合加速度 ×100（单位 g×100） */
-#define IMU_DATA_AX      1   /* X 轴加速度 ×100 */
-#define IMU_DATA_AY      2   /* Y 轴加速度 ×100 */
-#define IMU_DATA_AZ      3   /* Z 轴加速度 ×100 */
-#define IMU_DATA_TEMP    4   /* 温度 ℃×10 */
-
-/* 比较方式（阈值触发方向） */
-#define WARN_CMP_GT      0   /* 数据 > 阈值 触发 */
-#define WARN_CMP_EQ      1   /* 数据 == 阈值 触发 */
-#define WARN_CMP_LT      2   /* 数据 < 阈值 触发 */
-
-/* 单个安防位置的预警配置（0=前门 1=后门 2=窗户 3=仓库） */
-struct zone_warn_cfg {
-    int src;         /* 触发源：WARN_SRC_NONE / WARN_SRC_AP3216C / WARN_SRC_ICM */
-    int channel;     /* 数据通道（AP3216C 用 AP_DATA_PS/ALS/IR；ICM 用 IMU_DATA_MAG/AX/AY/AZ） */
-    int threshold;   /* 触发阈值（原始值或 ×100） */
-    int cmp;         /* 比较方式：WARN_CMP_GT / EQ / LT */
-    int enabled;     /* 1=启用该位置预警 */
-};
-
-/* 预警阈值配置（设置弹窗可调，采集线程实时生效） */
-struct dev_config {
-    struct zone_warn_cfg zones[4];  /* 四个安防位置 */
-    int debounce;                   /* 连续 N 次超限才触发（防抖） */
-    int cooldown_sec;               /* 消警后冷却秒数（期间不重复触发） */
-};
+/* 预警触发源 / 数据通道 / 阈值配置类型（config_types.h） */
+#include "config_types.h"
 
 /**
  * 读取预警阈值配置
  */
 void dev_bridge_get_config(struct dev_config *out);
+
+/* AP3216C 校准（ALS 比例 ×1000，PS/IR 环境本底偏移） */
+void dev_bridge_set_ap_calib(int ps_off, int ir_off, int als_scale_x1000);
+void dev_bridge_get_ap_calib(int *ps_off, int *ir_off, int *als_scale_x1000);
+
+/** 告警冷却剩余秒数（0=不在冷却） */
+int dev_bridge_get_cooldown_remain(int zone);
 
 /**
  * 设置预警阈值配置（采集线程下一轮生效）
@@ -103,6 +81,7 @@ void dev_bridge_set_config(const struct dev_config *cfg);
 
 /* ---- 测试面板手动控制（与自动跟随逻辑共享缓存，互不打架） ---- */
 void dev_bridge_set_beep(int on);         /* 手动开关板载蜂鸣器 */
+void dev_bridge_set_led(int on);          /* 手动开关板载 LED（告警时自动让位） */
 void dev_bridge_set_pwm(int on, int freq); /* 手动开关 PWM 蜂鸣器并设频率 */
 void dev_bridge_set_als_en(int en);       /* AP3216C 采集使能 */
 void dev_bridge_set_imu_en(int en);       /* ICM20608 采集使能 */

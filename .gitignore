@@ -38,15 +38,41 @@ core/lvgl/lvgl/idf_component.yml
 core/lvgl/lvgl/library.json
 core/lvgl/lvgl/library.properties
 
+# ===== 本地构建配置（含部署路径） =====
+config.mk
+
+# ===== 运行时配置（设备本地生成，不入库） =====
+gateway.json
+
 # ===== Python =====
 __pycache__/
 *.pyc
+
+# ===== 密钥/证书（本地生成，不入库；cloud/secrets/ 由 gen_*.sh 生成） =====
+cloud/secrets/
+cloud/certs/
+cloud/api.key
+cloud/keys/
+cloud/mqtt.pass
+cloud/mosquitto.passwd
+
+# ===== 字库生成工具依赖 =====
+tools/fontgen/node_modules/
 
 # ===== 系统文件 =====
 Thumbs.db
 .DS_Store
 desktop.ini
 third_party/
+
+# ===== 云端运行产物（日志/pid/缓存/OTA 打包中间物/模型权重） =====
+cloud/logs/
+cloud/__pycache__/
+*.pid
+*.pt
+cloud/ota/pkg-*.tar.gz
+cloud/ota/pkgroot/payload/
+cloud/ota/pkgroot/payload.tar.gz
 
 # ===== 白名单照片（个人隐私，不入库；本地自备 cloud/whitelist/<姓名>.jpg） =====
 cloud/whitelist/

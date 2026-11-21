@@ -74,6 +74,8 @@ typedef struct {
 int detector_get_boxes(detector_box_t *out, int max);
 
 void detector_init(void);
+/** 停止精判工作线程并 join（进程退出时调用） */
+void detector_stop(void);
 void detector_set_verifier(detector_verifier_fn fn);
 
 /**
