@@ -63,16 +63,18 @@ tools/fontgen/node_modules/
 Thumbs.db
 .DS_Store
 desktop.ini
-third_party/
 
-# ===== 云端运行产物（日志/pid/缓存/OTA 打包中间物/模型权重） =====
+# ===== 第三方依赖 =====
+# 入库：交叉编译产物（ncnn-armhf / mbedtls-armhf）+ 字库源（fonts），保证 clone 后可直接编译
+# 忽略：第三方源码树（仅重编库时需要，约 74MB）
+third_party/ncnn/
+third_party/mbedtls/
+third_party/mbedtls-2.28.8.tar.gz
+
+# ===== 云端运行产物（日志/pid/缓存） =====
 cloud/logs/
 cloud/__pycache__/
 *.pid
-*.pt
-cloud/ota/pkg-*.tar.gz
-cloud/ota/pkgroot/payload/
-cloud/ota/pkgroot/payload.tar.gz
 
 # ===== 白名单照片（个人隐私，不入库；本地自备 cloud/whitelist/<姓名>.jpg） =====
 cloud/whitelist/
