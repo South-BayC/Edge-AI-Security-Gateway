@@ -1,12 +1,13 @@
 # Edge AI Security Gateway — 边缘智能安防网关
 
-基于正点原子 I.MX6ULL ALPHA（EMMC 版）+ 7 寸 1024x600 触摸屏的嵌入式 Linux 综合工程，包含两个子项目：
+基于正点原子 I.MX6ULL ALPHA（EMMC 版）+ 7 寸 1024x600 触摸屏的嵌入式 Linux 综合工程：一套自研外设驱动 + 边缘智能安防网关应用 + 云端精判服务，三者共同构成完整可运行的系统。
 
-- **项目 A · 边缘智能安防网关**（`core/lvgl/` 应用 + `cloud/` 云端服务）
-  LVGL 中文触摸界面；帧差粗判 → 本地 SCRFD 人脸初判 → 云端复核定案（人员/类型判定 + 白名单比对）的两级入侵检测管线；
+- **外设驱动**（`core/` 各驱动模块）：自研内核驱动，为网关应用提供设备基础——
+  LED / 按键中断 / 多通道事件采集（kfifo+tracepoint）/ PWM 蜂鸣 / I2C 光感 / SPI 六轴 IMU / input 按键 / GT9147 触摸，
+  摄像头 OV5640 采用内核自带驱动接入。
+- **网关应用**（`core/lvgl/`）：LVGL 中文触摸界面；帧差粗判 → 本地 SCRFD 人脸初判 → 云端复核定案（人员/类型判定 + 白名单比对）的两级入侵检测管线；
   告警分级声光、抓拍存证、事件时间轴、MQTT 上报、OTA 升级。
-- **项目 B · 全外设驱动工程**（`core/` 各驱动模块）
-  LED / 按键中断 / 多通道事件采集（kfifo+tracepoint）/ PWM 蜂鸣 / I2C 光感 / SPI 六轴 IMU / input 按键 / GT9147 触摸。
+- **云端服务**（`cloud/`）：FastAPI + YOLOv8n 全类别检测 + face_recognition 白名单比对，为网关提供复核定案能力。
 
 | 项 | 内容 |
 |---|---|
@@ -218,6 +219,8 @@ wget -qO- http://127.0.0.1:8000/whitelist   # → {"names":["SZH"]}
 **上电自启**（rcS → `/usr/bin/lvgl_gateway`）。主界面布局：
 顶栏（时间/联网/布防状态）| 左侧摄像头预览（630x340，30fps）+ 单分区卡 | 右侧事件时间轴 + 传感器迷你面板 | 底栏大按钮。
 
+> 🎬 **板端演示视频**：[点击查看 `docs/picture/视频.mp4`](docs/picture/视频.mp4)（GitHub 不支持内嵌播放，需下载后观看）
+
 ### 4.1 日常操作
 
 | 操作 | 方式 |
@@ -229,6 +232,8 @@ wget -qO- http://127.0.0.1:8000/whitelist   # → {"names":["SZH"]}
 | 事件时间轴 | 右侧列表（类型着色），「清空」一键清空；条目「览」打开相册 |
 | 息屏与唤醒 | 10 分钟无操作自动息屏；**触摸或 KEY0 唤醒** |
 | 背光亮度 | 设置弹窗滑条（联动 pwm-backlight） |
+
+<img src="docs/picture/9.jpg" alt="9" style="zoom:50%;" />
 
 ### 4.2 检测页（底栏「检测」）
 
@@ -242,6 +247,8 @@ wget -qO- http://127.0.0.1:8000/whitelist   # → {"names":["SZH"]}
 | IO | LED / 蜂鸣 / 调速（PWM 频率滑条 + 30% 占空比）、按键电平 |
 | 系统 | CPU / 内存 / 运行时长 + 日志尾部滚动 |
 | 终端 | 调试 shell：无输入框，键盘输入直接回显提示行，回车执行；快捷命令（uname/free/ps/dmesg/ifconfig） |
+
+<img src="docs/picture/8.jpg" alt="8" style="zoom: 67%;" /><img src="docs/picture/3.jpg" alt="3" style="zoom: 50%;" /><img src="docs/picture/4.jpg" alt="4" style="zoom: 50%;" /><img src="docs/picture/5.jpg" alt="5" style="zoom: 50%;" /><img src="docs/picture/6.jpg" alt="6" style="zoom:50%;" />
 
 ### 4.3 设置弹窗
 
@@ -306,11 +313,11 @@ make clean        # 清理产物
 Edge-AI-Gateway/
 ├── Makefile                  # 顶层调度（all/core/dts/lvgl/test/clean/deploy）
 ├── config.mk.example         # 部署路径模板（复制为 config.mk）
-├── core/                     # ── 驱动工程 + 网关应用 ──
-│   ├── led/ key_event/ gpio_event_capture/ pwm_beep/          # 项目 B 驱动
+├── core/                     # 驱动 + 网关应用
+│   ├── led/ key_event/ gpio_event_capture/ pwm_beep/          # 自研驱动
 │   ├── ap3216c/ icm20608/ key_input/ gt9147/
 │   ├── Makefile              # 驱动批量编译（KDIR 指向内核源码树）
-│   └── lvgl/                 # ── 项目 A 网关应用 ──
+│   └── lvgl/                 # 网关应用
 │       ├── Makefile          #   交叉编译（链接 ncnn；find src 自动收源）
 │       ├── lv_conf.h         #   LVGL 配置（16bpp/部分刷新/内存 256KB）
 │       ├── lvgl/             #   LVGL v9.2.2 vendored（仅保留编译所需）
@@ -359,16 +366,7 @@ Edge-AI-Gateway/
 
 ---
 
-## 八、项目 B 进度（驱动工程，全部验收通过）
-
-- [x] P1 LED 字符设备（验收 4/4）· P2 按键中断三种读模式（5/5）· P3 gpio_event 企业级驱动（7/7 + 内核 ftrace）
-- [x] P4 PWM/I2C/SPI 子系统驱动 beep_pwm/ap3216c/icm20608（8/8）
-- [x] P6-1 input 按键驱动（PASS=10）
-- [x] P7-1 GT9147 触摸（中断模式 + 配置自愈）· P5 OV5640 采用内核自带驱动接入
-
----
-
-## 九、文档索引
+## 八、文档索引
 
 | 文档 | 内容 |
 |---|---|
